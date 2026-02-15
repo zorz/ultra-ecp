@@ -19,7 +19,7 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
 
-    "types": ["bun-types"]
+    "types": ["bun-types", "node"]
   },
   "include": ["src/**/*", "tests/**/*"]
 }

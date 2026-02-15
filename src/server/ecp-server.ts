@@ -6,38 +6,38 @@
 
 import { debugLog as globalDebugLog } from '../debug.ts';
 
-// @phase2 — Service imports. These resolve once services/ is extracted.
-// import { LocalDocumentService } from '../services/document/local.ts';
-// import { DocumentServiceAdapter } from '../services/document/adapter.ts';
-// import { FileServiceImpl } from '../services/file/service.ts';
-// import { FileServiceAdapter } from '../services/file/adapter.ts';
-// import { GitCliService } from '../services/git/cli.ts';
-// import { GitServiceAdapter } from '../services/git/adapter.ts';
-// import { LocalSessionService } from '../services/session/local.ts';
-// import { SessionServiceAdapter } from '../services/session/adapter.ts';
-// import { LocalLSPService } from '../services/lsp/service.ts';
-// import { LSPServiceAdapter } from '../services/lsp/adapter.ts';
-// import { LocalSyntaxService } from '../services/syntax/service.ts';
-// import { SyntaxServiceAdapter } from '../services/syntax/adapter.ts';
-// import { LocalTerminalService } from '../services/terminal/service.ts';
-// import { TerminalServiceAdapter } from '../services/terminal/adapter.ts';
-// import { LocalSecretService } from '../services/secret/local.ts';
-// import { SecretServiceAdapter } from '../services/secret/adapter.ts';
-// import { LocalDatabaseService } from '../services/database/local.ts';
-// import { DatabaseServiceAdapter } from '../services/database/adapter.ts';
-// import { LocalAIService } from '../services/ai/local.ts';
-// import { AIServiceAdapter } from '../services/ai/adapter.ts';
-// import { loadModels, refreshModels } from '../services/ai/model-registry.ts';
-// import { ChatServiceAdapter } from '../services/chat/adapter.ts';
-// import { ChatOrchestrator } from '../services/chat/services/ChatOrchestrator.ts';
-// import { WorkflowServiceAdapter } from '../services/chat/workflow-adapter.ts';
-// import { LocalAgentService } from '../services/agents/local.ts';
-// import { AgentServiceAdapter } from '../services/agents/adapter.ts';
-// import { AuthServiceAdapter } from '../services/auth/adapter.ts';
-// import { delegateToAgentTool, builderTools } from '../services/ai/tools/definitions.ts';
-// import { PersonaService } from '../services/chat/services/PersonaService.ts';
-// import { AgentService as ChatAgentService } from '../services/chat/services/AgentService.ts';
-// import { buildWorkflowAgentSystemPrompt } from '../services/ai/system-prompt.ts';
+// Service imports
+import { LocalDocumentService } from '../services/document/local.ts';
+import { DocumentServiceAdapter } from '../services/document/adapter.ts';
+import { FileServiceImpl } from '../services/file/service.ts';
+import { FileServiceAdapter } from '../services/file/adapter.ts';
+import { GitCliService } from '../services/git/cli.ts';
+import { GitServiceAdapter } from '../services/git/adapter.ts';
+import { LocalSessionService } from '../services/session/local.ts';
+import { SessionServiceAdapter } from '../services/session/adapter.ts';
+import { LocalLSPService } from '../services/lsp/service.ts';
+import { LSPServiceAdapter } from '../services/lsp/adapter.ts';
+import { LocalSyntaxService } from '../services/syntax/service.ts';
+import { SyntaxServiceAdapter } from '../services/syntax/adapter.ts';
+import { LocalTerminalService } from '../services/terminal/service.ts';
+import { TerminalServiceAdapter } from '../services/terminal/adapter.ts';
+import { LocalSecretService } from '../services/secret/local.ts';
+import { SecretServiceAdapter } from '../services/secret/adapter.ts';
+import { LocalDatabaseService } from '../services/database/local.ts';
+import { DatabaseServiceAdapter } from '../services/database/adapter.ts';
+import { LocalAIService } from '../services/ai/local.ts';
+import { AIServiceAdapter } from '../services/ai/adapter.ts';
+import { loadModels, refreshModels } from '../services/ai/model-registry.ts';
+import { ChatServiceAdapter } from '../services/chat/adapter.ts';
+import { ChatOrchestrator } from '../services/chat/services/ChatOrchestrator.ts';
+import { WorkflowServiceAdapter } from '../services/chat/workflow-adapter.ts';
+import { LocalAgentService } from '../services/agents/local.ts';
+import { AgentServiceAdapter } from '../services/agents/adapter.ts';
+import { AuthServiceAdapter } from '../services/auth/adapter.ts';
+import { delegateToAgentTool, builderTools } from '../services/ai/tools/definitions.ts';
+import { PersonaService } from '../services/chat/services/PersonaService.ts';
+import { AgentService as ChatAgentService } from '../services/chat/services/AgentService.ts';
+import { buildWorkflowAgentSystemPrompt } from '../services/ai/system-prompt.ts';
 
 // Types
 import {
@@ -206,7 +206,9 @@ export class ECPServer {
 
     // Initialize middleware chain
     this.middleware = createMiddlewareChain();
-    this.middleware.use(createSettingsSnapshotMiddleware());
+    this.middleware.use(createSettingsSnapshotMiddleware({
+      getAll: () => this.sessionService.getAllSettings() as unknown as Record<string, unknown>,
+    }));
     this.middleware.use(createCallerTelemetryMiddleware());
     this.middleware.use(createWorkingSetMiddleware());
     this.middleware.use(createValidationMiddleware());
