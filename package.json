@@ -21,6 +21,8 @@
     "test:services": "bun test tests/services/"
   },
   "dependencies": {
+    "bun-pty": "0.4.2",
+    "node-pty": "1.1.0",
     "postgres": "^3.4.8",
     "shiki": "^3.22.0",
     "yaml": "^2.8.2",
