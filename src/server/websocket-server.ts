@@ -397,6 +397,11 @@ export class ECPWebSocketServer {
           }
         },
 
+        pong(ws) {
+          // Client responded to our ping — update activity so heartbeat doesn't kill it
+          ws.data.lastActivity = Date.now();
+        },
+
         close(ws) {
           // Clear auth timeout if still pending
           if (ws.data.authTimeout) {

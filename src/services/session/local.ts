@@ -1148,10 +1148,10 @@ ${JSON.stringify(allSettings, null, 2)}
     // Try multiple possible locations for the themes directory
     const execDir = path.dirname(process.execPath);
     const possiblePaths = [
+      path.join(process.env.HOME || '', '.ultra/config/themes'), // User config directory
       `${import.meta.dir}/../../../config/themes`,           // Relative to source file (dev)
       path.join(process.cwd(), 'config/themes'),              // Relative to cwd
       path.join(execDir, 'config/themes'),                    // Relative to executable (bundled)
-      path.join(process.env.HOME || '', 'Development/ultra-editor/config/themes'), // Fallback dev location
     ];
 
     let themesDir: string | null = null;
