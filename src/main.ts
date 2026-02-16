@@ -37,7 +37,7 @@ function parseArgs(args: string[]): CLIOptions {
     const portArg = args[portIndex + 1];
     if (portArg) {
       const parsed = parseInt(portArg, 10);
-      if (!isNaN(parsed) && parsed > 0 && parsed < 65536) {
+      if (!isNaN(parsed) && parsed >= 0 && parsed < 65536) {
         port = parsed;
       } else {
         console.error(`Invalid port: ${portArg}`);
@@ -106,7 +106,8 @@ async function main(): Promise<void> {
 
   await wsServer.start();
 
-  const wsUrl = `ws://${hostname}:${options.port}/ws`;
+  const actualPort = wsServer.getPort();
+  const wsUrl = `ws://${hostname}:${actualPort}/ws`;
 
   console.log(`────────────────────────────────────────────────────────────────`);
   console.log(`\n  Server running!\n`);

@@ -609,10 +609,10 @@ export class ECPWebSocketServer {
   }
 
   /**
-   * Get the server port.
+   * Get the actual server port (resolved from OS if port 0 was used).
    */
   getPort(): number {
-    return this.options.port;
+    return this.server?.port ?? this.options.port;
   }
 
   /**
