@@ -165,6 +165,8 @@ export class AIServiceAdapter {
   private chatAgentService: ChatAgentService | null = null;
   /** Callback to get the default AI model from settings */
   private getDefaultModel: (() => string) | null = null;
+  /** ECP request function for recording tool calls to chat DB */
+  private ecpRequest: ((method: string, params?: unknown) => Promise<unknown>) | null = null;
 
   constructor(service: LocalAIService, workspaceRoot?: string) {
     this.service = service;
@@ -268,6 +270,15 @@ export class AIServiceAdapter {
    */
   setDefaultModelGetter(getter: () => string): void {
     this.getDefaultModel = getter;
+  }
+
+  /**
+   * Set the ECP request function for recording tool calls to the chat DB.
+   */
+  setECPRequest(fn: (method: string, params?: unknown) => Promise<unknown>): void {
+    this.ecpRequest = fn;
+    this.service.setEcpRequest(fn);
+    debugLog('[AIServiceAdapter] ECP request function set');
   }
 
   /**
@@ -651,6 +662,7 @@ export class AIServiceAdapter {
         openai: 'OpenAI',
         gemini: 'Gemini',
         ollama: 'Ollama',
+        'agent-sdk': 'Claude (Agent SDK)',
       };
 
       // Convert ECP message format to internal ChatMessage format for session restoration
@@ -870,6 +882,51 @@ export class AIServiceAdapter {
           handoffState.delegateToolId = null;
         }
 
+        // Record tool calls to chat DB for activity pane
+        // Only when storageSessionId is available (references the chat DB sessions table)
+        if (evt.type === 'tool_use_started' && this.ecpRequest && p.storageSessionId) {
+          this.ecpRequest('chat/toolCall/add', {
+            id: evt.toolUseId,
+            sessionId: p.storageSessionId,
+            toolName: evt.toolName,
+            input: evt.input,
+            agentId: targetAgent?.id,
+            agentName: targetAgent?.name,
+          }).catch((err) => {
+            debugLog(`[AIServiceAdapter] Failed to record tool call start: ${err}`);
+          });
+        }
+        if (evt.type === 'tool_use_result' && this.ecpRequest && p.storageSessionId) {
+          this.ecpRequest('chat/toolCall/complete', {
+            id: evt.toolUseId,
+            sessionId: p.storageSessionId,
+            output: evt.result,
+            errorMessage: (evt as Record<string, unknown>).success === false ? String(evt.result) : undefined,
+          }).catch((err) => {
+            debugLog(`[AIServiceAdapter] Failed to record tool call result: ${err}`);
+          });
+        }
+
+        // Bridge Agent SDK TodoWrite to chat DB via ECP todo system
+        if (evt.type === 'todo_update' && Array.isArray(evt.todos)) {
+          const sessionId = p.storageSessionId || null;
+          const todos = (evt.todos as Array<Record<string, unknown>>).map((t, i) => ({
+            content: String(t.content || ''),
+            status: (t.status as string) || 'pending',
+            activeForm: t.activeForm ? String(t.activeForm) : undefined,
+          }));
+          // Route through ECP which persists to chat.db and sends chat/todo/replaced
+          if (this.ecpRequest) {
+            this.ecpRequest('ai/todo/write', { sessionId, todos }).catch(err => {
+              debugLog(`[AIServiceAdapter] Failed to bridge TodoWrite: ${err}`);
+            });
+          }
+          return; // Don't forward synthetic event to GUI
+        }
+
+        // Bridge Agent SDK tool_use_started for DocumentCreate/Update/etc. tools
+        // to ECP document system (future: intercept and forward)
+
         // Augment events with agent info for attribution
         const augmentedEvent = targetAgent ? {
           ...event,
@@ -1045,7 +1102,8 @@ export class AIServiceAdapter {
     const success = this.service.approveToolPermission(
       p.toolUseId,
       p.scope || 'once',
-      p.folderPath
+      p.folderPath,
+      p.answers
     );
     return { result: { approved: success, scope: p.scope || 'once' } };
   }

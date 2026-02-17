@@ -12,7 +12,7 @@
 /**
  * Supported AI providers.
  */
-export type AIProviderType = 'claude' | 'openai' | 'gemini' | 'ollama';
+export type AIProviderType = 'claude' | 'openai' | 'gemini' | 'ollama' | 'agent-sdk';
 
 /**
  * Provider configuration.

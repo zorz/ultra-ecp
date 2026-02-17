@@ -37,6 +37,9 @@ import './claude-http.ts';
 import './openai-http.ts';
 import './gemini-http.ts';
 
+// Import Agent SDK provider
+import './agent-sdk.ts';
+
 import type { AIProviderConfig } from '../types.ts';
 import { createClaudeHTTPProvider } from './claude-http.ts';
 import { createOpenAIHTTPProvider } from './openai-http.ts';
@@ -56,6 +59,8 @@ export function createHTTPProvider(config: AIProviderConfig): AIProvider | null 
       return createOpenAIHTTPProvider(config);
     case 'gemini':
       return createGeminiHTTPProvider(config);
+    case 'agent-sdk':
+      return null; // Agent SDK is not an HTTP provider
     default:
       return null;
   }

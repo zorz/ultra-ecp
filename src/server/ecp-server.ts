@@ -201,6 +201,9 @@ export class ECPServer {
     // Configure AI service with ECP request function
     this.aiService.setECPRequest(this.request.bind(this));
 
+    // Configure AI adapter with ECP request for recording tool calls to chat DB
+    this.aiAdapter.setECPRequest(this.request.bind(this));
+
     // Set up notification forwarding
     this.setupNotificationHandlers();
 

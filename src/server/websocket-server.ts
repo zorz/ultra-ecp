@@ -325,6 +325,10 @@ export class ECPWebSocketServer {
 
       // WebSocket handlers
       websocket: {
+        // Disable Bun's built-in idle timeout — we have our own heartbeat/stale detection
+        idleTimeout: 960, // 16 minutes (max Bun allows); our heartbeat handles detection
+        sendPings: false, // We send our own pings in startHeartbeat()
+
         open(ws) {
           self.clients.set(ws.data.id, ws);
           self.debugLog(`Client connected: ${ws.data.id} (total: ${self.clients.size})`);
@@ -501,17 +505,18 @@ export class ECPWebSocketServer {
 
   /**
    * Start the heartbeat timer for detecting stale connections.
+   * Runs regardless of auth config to keep connections alive during long operations.
    */
   private startHeartbeat(): void {
-    if (!this.authConfig) return;
-
-    const interval = getHeartbeatInterval(this.authConfig);
+    const interval = this.authConfig
+      ? getHeartbeatInterval(this.authConfig)
+      : 30_000; // Default 30s if no auth config
     if (interval <= 0) return;
 
     this.heartbeatTimer = setInterval(() => {
       const now = Date.now();
-      // Stale threshold: 3x heartbeat interval with no activity
-      const staleThreshold = interval * 3;
+      // Stale threshold: 5x heartbeat interval (2.5 min) to tolerate long-running operations
+      const staleThreshold = interval * 5;
 
       for (const [id, ws] of this.clients) {
         // Skip clients still in auth handshake (they have their own timeout)

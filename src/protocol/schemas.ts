@@ -242,7 +242,7 @@ export const SessionDeleteParamsSchema = z.object({
 // AI Service Schemas
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const AIProviderTypeSchema = z.enum(['claude', 'openai', 'gemini', 'ollama']);
+export const AIProviderTypeSchema = z.enum(['claude', 'openai', 'gemini', 'ollama', 'agent-sdk']);
 
 /** Message schema for session context restoration */
 export const AISessionMessageSchema = z.object({
@@ -480,6 +480,8 @@ export const AIPermissionApproveParamsSchema = z.object({
   toolUseId: z.string().min(1, 'toolUseId is required'),
   scope: z.enum(['once', 'session', 'folder']).optional(),
   folderPath: z.string().optional(),
+  /** Answers for AskUserQuestion tool — keyed by question header */
+  answers: z.record(z.string(), z.string()).optional(),
 });
 
 export const AIPermissionDenyParamsSchema = z.object({

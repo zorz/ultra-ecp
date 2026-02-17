@@ -446,7 +446,7 @@ export const settingsSchema: SettingsSchema = {
     'ai.provider': {
       type: 'string',
       default: 'anthropic',
-      enum: ['anthropic', 'openai', 'google', 'ollama'],
+      enum: ['anthropic', 'openai', 'google', 'ollama', 'agent-sdk'],
       description: 'AI provider to use',
     },
     'ai.model': {

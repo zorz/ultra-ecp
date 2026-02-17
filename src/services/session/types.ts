@@ -284,6 +284,24 @@ export interface FlexGuiUIState {
   activeTabs: Record<string, string>;
   /** Theme ID */
   themeId?: string;
+
+  // Ultra GUI workspace layout
+  /** Whether the left sidebar (sessions) is visible */
+  leftSidebarVisible?: boolean;
+  /** Left sidebar width in points */
+  leftSidebarWidth?: number;
+  /** Whether the right sidebar (inspector) is visible */
+  rightSidebarVisible?: boolean;
+  /** Right sidebar width in points */
+  rightSidebarWidth?: number;
+  /** Active tab in the right sidebar */
+  rightSidebarTab?: string;
+  /** Whether the content panel is visible */
+  contentPanelVisible?: boolean;
+  /** Ratio of center area given to chat (0.0–1.0) */
+  contentPanelRatio?: number;
+  /** Whether follow mode is enabled */
+  followMode?: boolean;
 }
 
 export interface FlexGuiSessionState {

@@ -64,13 +64,13 @@ import './providers/ollama.ts';
 /**
  * Pending permission request.
  */
-interface PendingPermission {
+export interface PendingPermission {
   /** Tool use content */
   toolUse: ToolUseContent;
   /** Session ID */
   sessionId: string;
   /** Resolve function for the promise */
-  resolve: (approved: boolean) => void;
+  resolve: (approved: boolean, answers?: Record<string, string>) => void;
   /** Timestamp when request was made */
   timestamp: number;
 }
@@ -95,6 +95,9 @@ export class LocalAIService implements AIService {
 
   /** Cached tool translators per provider */
   private translators: Map<string, ToolTranslator> = new Map();
+
+  /** ECP request function for internal calls (set by adapter) */
+  private ecpRequest?: (method: string, params?: unknown) => Promise<unknown>;
 
   constructor() {
     this.pipeline = createPipeline();
@@ -161,6 +164,20 @@ export class LocalAIService implements AIService {
     // Caller identity is asserted server-side at the ECP boundary.
     this.toolExecutor.setCaller({ type: 'agent', agentId: 'local-ai-service' });
     this.log('ECP request function configured');
+  }
+
+  /**
+   * Register an external pending permission (e.g. from Agent SDK's canUseTool).
+   * This allows the standard approve/deny endpoints to resolve SDK permissions.
+   */
+  registerPendingPermission(toolUseId: string, pending: PendingPermission): void {
+    this.pendingPermissions.set(toolUseId, pending);
+    this.log(`Registered external pending permission: ${toolUseId} (${pending.toolUse.name})`);
+  }
+
+  /** Set the ECP request function for internal routing (called by adapter). */
+  setEcpRequest(fn: (method: string, params?: unknown) => Promise<unknown>): void {
+    this.ecpRequest = fn;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -232,7 +249,27 @@ export class LocalAIService implements AIService {
       this.log(`Resuming CLI session: ${options.cliSessionId}`);
     }
 
+    // Wire Agent SDK provider into the ECP permission system and ECP request bridge
+    if (provider.type === 'agent-sdk' && 'setPermissionRegistry' in provider) {
+      const sdkProvider = provider as {
+        setPermissionRegistry: (fn: (id: string, pending: PendingPermission) => void) => void;
+        setEcpRequest: (fn: (method: string, params?: unknown) => Promise<unknown>) => void;
+      };
+      sdkProvider.setPermissionRegistry((id, pending) => this.registerPendingPermission(id, pending));
+      if (this.ecpRequest) {
+        sdkProvider.setEcpRequest(this.ecpRequest);
+      }
+      this.log('Wired Agent SDK provider permission registry + ECP request');
+    }
+
     this.providers.set(sessionId, provider);
+
+    // Build session metadata, including provider-specific info
+    const metadata: Record<string, unknown> = { ...options.metadata };
+    if ('getAuthMethod' in provider && typeof provider.getAuthMethod === 'function') {
+      const authMethod = provider.getAuthMethod();
+      if (authMethod) metadata.authMethod = authMethod;
+    }
 
     const session: ChatSession = {
       id: sessionId,
@@ -241,7 +278,7 @@ export class LocalAIService implements AIService {
       state: 'idle',
       tools: options.tools || this.getToolsForProvider(options.provider.type),
       systemPrompt: options.systemPrompt,
-      metadata: options.metadata,
+      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       cliSessionId: options.cliSessionId,
       cwd: options.cwd,
       createdAt: Date.now(),
@@ -1071,13 +1108,15 @@ export class LocalAIService implements AIService {
    * @param toolUseId - The tool use ID
    * @param scope - The approval scope (once, session, folder)
    * @param folderPath - Required for folder scope, the folder to approve for
+   * @param answers - Optional answers for AskUserQuestion tool
    */
   approveToolPermission(
     toolUseId: string,
     scope: ApprovalScope = 'once',
-    folderPath?: string
+    folderPath?: string,
+    answers?: Record<string, string>
   ): boolean {
-    this.log(`[PERMISSION] approveToolPermission called: toolUseId=${toolUseId}, scope=${scope}, folderPath=${folderPath || '(none)'}`);
+    this.log(`[PERMISSION] approveToolPermission called: toolUseId=${toolUseId}, scope=${scope}, folderPath=${folderPath || '(none)'}, answers=${answers ? JSON.stringify(answers) : '(none)'}`);
     this.log(`[PERMISSION] Current pending permissions: ${Array.from(this.pendingPermissions.keys()).join(', ') || '(none)'}`);
 
     const pending = this.pendingPermissions.get(toolUseId);
@@ -1110,7 +1149,7 @@ export class LocalAIService implements AIService {
 
     this.log(`[PERMISSION] Removing pending permission and resolving promise with true`);
     this.pendingPermissions.delete(toolUseId);
-    pending.resolve(true);
+    pending.resolve(true, answers);
     this.log(`[PERMISSION] Permission approved for tool: ${pending.toolUse.name} (scope: ${scope})`);
     this.log(`[PERMISSION] Remaining pending permissions: ${this.pendingPermissions.size}`);
     return true;

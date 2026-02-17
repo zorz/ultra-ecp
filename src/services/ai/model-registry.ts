@@ -19,7 +19,7 @@ import { debugLog, isDebugEnabled } from '../../debug.ts';
 export interface ModelInfo {
   id: string;
   name: string;
-  provider: 'anthropic' | 'openai' | 'google' | 'ollama' | 'custom';
+  provider: 'anthropic' | 'openai' | 'google' | 'ollama' | 'agent-sdk' | 'custom';
   capabilities: string[];
   contextWindow?: number;
   maxOutputTokens?: number;
@@ -117,6 +117,10 @@ const MODEL_METADATA: Record<string, Partial<ModelInfo>> = {
   'claude-3-7-sonnet-20250219': { name: 'Claude Sonnet 3.7', capabilities: ANTHROPIC_CAPABILITIES, contextWindow: 200000, maxOutputTokens: 8192, pricing: 'medium', speed: 'medium', quality: 'excellent' },
   'claude-3-5-haiku-20241022': { name: 'Claude Haiku 3.5', capabilities: ['chat', 'code', 'tools', 'streaming', 'json-mode', 'long-context'], contextWindow: 200000, maxOutputTokens: 8192, pricing: 'low', speed: 'fast', quality: 'good' },
   'claude-3-haiku-20240307': { name: 'Claude Haiku 3', capabilities: ['chat', 'code', 'tools', 'streaming'], contextWindow: 200000, maxOutputTokens: 4096, pricing: 'low', speed: 'fast', quality: 'good' },
+  // Agent SDK (uses Claude models via local subscription with full agentic capabilities)
+  'agent-sdk:claude-opus-4-6': { name: 'Agent SDK: Opus 4.6', capabilities: ANTHROPIC_CAPABILITIES, contextWindow: 200000, maxOutputTokens: 32000, pricing: 'premium', speed: 'slow', quality: 'best' },
+  'agent-sdk:claude-sonnet-4-5-20250929': { name: 'Agent SDK: Sonnet 4.5', capabilities: ANTHROPIC_CAPABILITIES, contextWindow: 200000, maxOutputTokens: 16000, pricing: 'medium', speed: 'medium', quality: 'best' },
+  'agent-sdk:claude-haiku-4-5-20251001': { name: 'Agent SDK: Haiku 4.5', capabilities: ANTHROPIC_CAPABILITIES, contextWindow: 200000, maxOutputTokens: 8192, pricing: 'low', speed: 'fast', quality: 'excellent' },
 };
 
 // ============================================
@@ -163,6 +167,7 @@ function createModelInfo(id: string, provider: ModelInfo['provider']): ModelInfo
   const defaultCapabilities = provider === 'openai' ? OPENAI_CAPABILITIES
     : provider === 'google' ? GEMINI_CAPABILITIES
     : provider === 'anthropic' ? ANTHROPIC_CAPABILITIES
+    : provider === 'agent-sdk' ? ANTHROPIC_CAPABILITIES
     : ['chat', 'streaming'];
 
   return {
@@ -627,6 +632,33 @@ export async function loadModels(): Promise<ModelsConfig> {
   } catch (error) {
     // Ollama not available, keep existing ollama models in config
     log(`Could not fetch Ollama models: ${error}`);
+  }
+
+  // Add Agent SDK models (uses local subscription via claude-agent-sdk)
+  try {
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    // SDK is available — add agent-sdk models if not already present
+    const agentSdkModels = [
+      { id: 'agent-sdk:claude-opus-4-6', name: 'Agent SDK: Opus 4.6' },
+      { id: 'agent-sdk:claude-sonnet-4-5-20250929', name: 'Agent SDK: Sonnet 4.5' },
+      { id: 'agent-sdk:claude-haiku-4-5-20251001', name: 'Agent SDK: Haiku 4.5' },
+    ];
+
+    // Remove existing agent-sdk models to refresh
+    config.models = config.models.filter(m => m.provider !== 'agent-sdk');
+
+    for (const model of agentSdkModels) {
+      config.models.push(createModelInfo(model.id, 'agent-sdk'));
+    }
+
+    if (!config.providerDefaults['agent-sdk']) {
+      config.providerDefaults['agent-sdk'] = 'agent-sdk:claude-sonnet-4-5-20250929';
+    }
+
+    log(`Added ${agentSdkModels.length} Agent SDK models`);
+  } catch {
+    // Agent SDK not installed, skip
+    log('Agent SDK not available, skipping agent-sdk models');
   }
 
   return config;

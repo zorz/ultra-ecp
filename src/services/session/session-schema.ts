@@ -221,6 +221,15 @@ const FlexGuiUIStateSchema = z.object({
   focusedTileId: z.string(),
   activeTabs: z.record(z.string(), z.string()),
   themeId: z.string().optional(),
+  // Ultra GUI workspace layout
+  leftSidebarVisible: z.boolean().optional(),
+  leftSidebarWidth: z.number().optional(),
+  rightSidebarVisible: z.boolean().optional(),
+  rightSidebarWidth: z.number().optional(),
+  rightSidebarTab: z.string().optional(),
+  contentPanelVisible: z.boolean().optional(),
+  contentPanelRatio: z.number().optional(),
+  followMode: z.boolean().optional(),
 });
 
 /**
