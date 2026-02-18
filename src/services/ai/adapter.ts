@@ -911,7 +911,8 @@ export class AIServiceAdapter {
         if (evt.type === 'todo_update' && Array.isArray(evt.todos)) {
           const sessionId = p.storageSessionId || null;
           const todos = (evt.todos as Array<Record<string, unknown>>).map((t, i) => ({
-            content: String(t.content || ''),
+            // Agent SDK TodoWrite may send `subject` (from TaskCreate) or `content`
+            content: String(t.content || t.subject || ''),
             status: (t.status as string) || 'pending',
             activeForm: t.activeForm ? String(t.activeForm) : undefined,
           }));

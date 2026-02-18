@@ -1151,7 +1151,8 @@ ${JSON.stringify(allSettings, null, 2)}
       path.join(process.env.HOME || '', '.ultra/config/themes'), // User config directory
       `${import.meta.dir}/../../../config/themes`,           // Relative to source file (dev)
       path.join(process.cwd(), 'config/themes'),              // Relative to cwd
-      path.join(execDir, 'config/themes'),                    // Relative to executable (bundled)
+      path.join(execDir, 'config/themes'),                    // Relative to executable (bundled MacOS/)
+      path.join(execDir, '../Resources/config/themes'),       // Relative to executable (bundled Resources/)
     ];
 
     let themesDir: string | null = null;
@@ -1218,8 +1219,8 @@ ${JSON.stringify(allSettings, null, 2)}
     const possiblePaths = [
       `${import.meta.dir}/../../../config/default-keybindings.jsonc`,  // Relative to source file (dev)
       path.join(process.cwd(), 'config/default-keybindings.jsonc'),     // Relative to cwd
-      path.join(execDir, 'config/default-keybindings.jsonc'),           // Relative to executable (bundled)
-      path.join(process.env.HOME || '', 'Development/ultra-editor/config/default-keybindings.jsonc'), // Fallback dev location
+      path.join(execDir, 'config/default-keybindings.jsonc'),           // Relative to executable (bundled MacOS/)
+      path.join(execDir, '../Resources/config/default-keybindings.jsonc'), // Relative to executable (bundled Resources/)
     ];
 
     let keybindingsFile: string | null = null;

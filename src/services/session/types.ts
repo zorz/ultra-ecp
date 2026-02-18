@@ -290,10 +290,14 @@ export interface FlexGuiUIState {
   leftSidebarVisible?: boolean;
   /** Left sidebar width in points */
   leftSidebarWidth?: number;
+  /** Whether the left sidebar stays visible when not hovered */
+  leftSidebarPinned?: boolean;
   /** Whether the right sidebar (inspector) is visible */
   rightSidebarVisible?: boolean;
   /** Right sidebar width in points */
   rightSidebarWidth?: number;
+  /** Whether the right sidebar stays visible when not hovered */
+  rightSidebarPinned?: boolean;
   /** Active tab in the right sidebar */
   rightSidebarTab?: string;
   /** Whether the content panel is visible */

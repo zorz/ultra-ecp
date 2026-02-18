@@ -224,8 +224,10 @@ const FlexGuiUIStateSchema = z.object({
   // Ultra GUI workspace layout
   leftSidebarVisible: z.boolean().optional(),
   leftSidebarWidth: z.number().optional(),
+  leftSidebarPinned: z.boolean().optional(),
   rightSidebarVisible: z.boolean().optional(),
   rightSidebarWidth: z.number().optional(),
+  rightSidebarPinned: z.boolean().optional(),
   rightSidebarTab: z.string().optional(),
   contentPanelVisible: z.boolean().optional(),
   contentPanelRatio: z.number().optional(),

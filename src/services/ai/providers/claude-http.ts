@@ -369,6 +369,12 @@ export class ClaudeHTTPProvider extends BaseAIProvider {
                   id: toolId,
                   name: toolName,
                 } as StreamEvent);
+              } else if (event.content_block?.type === 'thinking') {
+                onEvent({
+                  type: 'content_block_start',
+                  index: event.index,
+                  contentBlock: { type: 'thinking' },
+                } as StreamEvent);
               }
               break;
 
@@ -379,6 +385,12 @@ export class ClaudeHTTPProvider extends BaseAIProvider {
                   type: 'content_block_delta',
                   index: event.index,
                   delta: { type: 'text_delta', text: event.delta.text || '' },
+                });
+              } else if (event.delta?.type === 'thinking_delta') {
+                onEvent({
+                  type: 'content_block_delta',
+                  index: event.index,
+                  delta: { type: 'thinking_delta', text: event.delta.thinking || '' },
                 });
               } else if (event.delta?.type === 'input_json_delta') {
                 const tool = toolUses.get(event.index);

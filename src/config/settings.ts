@@ -109,6 +109,16 @@ export interface EditorSettings {
   'governance.workingSet.bypassAgents': string[];
   /** Optional deny-list of agent role types that bypass Working Set governance. Empty => nobody bypasses. */
   'governance.workingSet.bypassRoles': string[];
+
+  // Window frame (GUI persistence)
+  /** Window width in points (-1 = use default) */
+  'window.width': number;
+  /** Window height in points (-1 = use default) */
+  'window.height': number;
+  /** Window x position (-1 = let macOS decide) */
+  'window.x': number;
+  /** Window y position (-1 = let macOS decide) */
+  'window.y': number;
 }
 
 const defaultSettings: EditorSettings = {
@@ -200,7 +210,13 @@ const defaultSettings: EditorSettings = {
   // Default ON: Working Set is a safety boundary for agent actions.
   'governance.workingSet.enforcementEnabled': true,
   'governance.workingSet.bypassAgents': [],
-  'governance.workingSet.bypassRoles': []
+  'governance.workingSet.bypassRoles': [],
+
+  // Window frame — -1 means "let macOS decide"
+  'window.width': -1,
+  'window.height': -1,
+  'window.x': -1,
+  'window.y': -1
 };
 
 export class Settings {

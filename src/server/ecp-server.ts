@@ -355,6 +355,7 @@ export class ECPServer {
    */
   async initialize(): Promise<void> {
     await this.sessionService.init(this.workspaceRoot);
+    this.sessionService.startAutoSave(5000); // Save dirty session state every 5s
     await this.secretService.init();
     await this.databaseService.init(this.workspaceRoot);
     await this.aiService.init();
@@ -1210,6 +1211,10 @@ export class ECPServer {
 
     // Chat storage service
     if (method.startsWith('chat/')) {
+      // Intercept generate-title to coordinate between chat + AI adapters
+      if (method === 'chat/session/generate-title') {
+        return this.handleGenerateTitle(params);
+      }
       return this.chatAdapter.handleRequest(method, params);
     }
 
@@ -1240,6 +1245,106 @@ export class ECPServer {
         message: `Method not found: ${method}`,
       },
     };
+  }
+
+  /**
+   * Generate a title for a chat session using AI.
+   *
+   * Reads the first few messages, asks the AI for a concise title,
+   * updates the session in the DB, and sends a notification.
+   */
+  private async handleGenerateTitle(params: unknown): Promise<HandlerResult> {
+    const p = params as { sessionId: string; force?: boolean };
+    if (!p?.sessionId) {
+      return { error: { code: ECPErrorCodes.InvalidParams, message: 'sessionId required' } };
+    }
+
+    try {
+      // 1. Check if session already has a title (skip unless forced)
+      const sessionResult = await this.chatAdapter.handleRequest('chat/session/get', { id: p.sessionId });
+      const session = (sessionResult as any)?.result;
+      if (session?.title && !p.force) {
+        return { result: { title: session.title, skipped: true } };
+      }
+
+      // 2. Read the first 6 messages
+      const msgResult = await this.chatAdapter.handleRequest('chat/message/list', {
+        sessionId: p.sessionId,
+        limit: 6,
+      });
+      const messages = (msgResult as any)?.result as Array<{ role: string; content: string }> | undefined;
+      if (!messages || messages.length === 0) {
+        return { result: { title: null, skipped: true } };
+      }
+
+      // 3. Format messages for the naming prompt
+      const formatted = messages
+        .filter(m => m.content && m.role !== 'system')
+        .map(m => `${m.role}: ${m.content.slice(0, 300)}`)
+        .join('\n');
+
+      // 4. Generate title via AI
+      let title: string | null = null;
+      try {
+        // Create a temp AI session
+        const provider = session?.provider || 'anthropic';
+        const model = session?.model || 'claude-sonnet-4-5-20250929';
+        const createResult = await this.aiAdapter.handleRequest('ai/session/create', {
+          provider,
+          model,
+        });
+        const tempSessionId = (createResult as any)?.result?.id;
+
+        if (tempSessionId) {
+          // Send naming prompt
+          const sendResult = await this.aiAdapter.handleRequest('ai/message/send', {
+            sessionId: tempSessionId,
+            content: `Generate a concise 3-6 word title for this conversation. Reply with ONLY the title, nothing else.\n\n${formatted}`,
+          });
+          const response = (sendResult as any)?.result;
+          title = response?.content?.trim()
+            || response?.text?.trim()
+            || null;
+
+          // Strip surrounding quotes if present
+          if (title && /^["'].*["']$/.test(title)) {
+            title = title.slice(1, -1);
+          }
+
+          // Clean up temp session
+          await this.aiAdapter.handleRequest('ai/session/delete', { sessionId: tempSessionId });
+        }
+      } catch {
+        // AI call failed — fall back to truncating the first user message
+      }
+
+      // 5. Fallback: use truncated first user message
+      if (!title) {
+        const firstUser = messages.find(m => m.role === 'user');
+        if (firstUser?.content) {
+          title = firstUser.content.slice(0, 40).trim();
+          if (firstUser.content.length > 40) title += '...';
+        }
+      }
+
+      if (!title) {
+        return { result: { title: null, skipped: true } };
+      }
+
+      // 6. Update session title in DB
+      await this.chatAdapter.handleRequest('chat/session/update', {
+        id: p.sessionId,
+        title,
+      });
+
+      // 7. Send notification so clients update their sidebar
+      this.emitNotification('chat/session/updated', { id: p.sessionId, title });
+
+      return { result: { title } };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { error: { code: ECPErrorCodes.InternalError, message } };
+    }
   }
 
   /**

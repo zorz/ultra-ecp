@@ -345,6 +345,12 @@ export class LocalAIService implements AIService {
       throw new Error(`Session not found: ${options.sessionId}`);
     }
 
+    if (session.state === 'streaming' || session.state === 'tool_use') {
+      throw new Error(
+        `Session is busy (${session.state}). Cancel the current operation before sending a new message.`
+      );
+    }
+
     const provider = this.providers.get(options.sessionId);
     if (!provider) {
       throw new Error(`Provider not found for session: ${options.sessionId}`);
@@ -433,6 +439,15 @@ export class LocalAIService implements AIService {
     const session = this.sessions.get(options.sessionId);
     if (!session) {
       throw new Error(`Session not found: ${options.sessionId}`);
+    }
+
+    // Guard against concurrent streaming on the same session.
+    // If a stream is already active (streaming or waiting for tool approval),
+    // reject the new message to prevent state corruption.
+    if (session.state === 'streaming' || session.state === 'tool_use') {
+      throw new Error(
+        `Session is busy (${session.state}). Cancel the current operation before sending a new message.`
+      );
     }
 
     const provider = this.providers.get(options.sessionId);

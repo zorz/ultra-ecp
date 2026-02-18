@@ -321,18 +321,19 @@ export class ChatServiceAdapter {
       id: string; sessionId: string; role: string; content: string;
       model?: string; inputTokens?: number; outputTokens?: number; durationMs?: number;
       agentId?: string; agentName?: string; agentRole?: string;
+      blocksJson?: string;
     };
     const db = this.db();
 
     db.run(
       `INSERT OR REPLACE INTO messages
        (id, session_id, role, content, model, input_tokens, output_tokens, duration_ms,
-        agent_id, agent_name, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        agent_id, agent_name, blocks_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         p.id, p.sessionId, p.role === 'tool' ? 'tool_call' : p.role, p.content,
         p.model ?? null, p.inputTokens ?? null, p.outputTokens ?? null, p.durationMs ?? null,
-        p.agentId ?? null, p.agentName ?? null, Date.now(),
+        p.agentId ?? null, p.agentName ?? null, p.blocksJson ?? null, Date.now(),
       ]
     );
 
@@ -1136,6 +1137,7 @@ export class ChatServiceAdapter {
       durationMs: row.duration_ms,
       agentId: row.agent_id,
       agentName: row.agent_name,
+      blocksJson: row.blocks_json ?? null,
       isActive: row.is_active === 1,
       isComplete: row.is_complete === 1,
       iterationNumber: row.iteration_number,

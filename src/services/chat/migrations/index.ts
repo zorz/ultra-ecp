@@ -20,6 +20,7 @@ export * from './runner.ts';
 import { migration005UnifiedSchema } from './005-unified-schema.ts';
 // Incremental migrations
 import { migration006PersonaAgency } from './006-persona-agency.ts';
+import { migration007MessageBlocks } from './007-message-blocks.ts';
 import type { Migration } from './runner.ts';
 
 /**
@@ -29,6 +30,7 @@ import type { Migration } from './runner.ts';
 export const migrations: Migration[] = [
   migration005UnifiedSchema,
   migration006PersonaAgency,
+  migration007MessageBlocks,
 ];
 
 /**

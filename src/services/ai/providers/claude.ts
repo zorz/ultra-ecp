@@ -56,6 +56,7 @@ interface ClaudeStreamEvent {
   delta?: {
     type?: string;
     text?: string;
+    thinking?: string;
     partial_json?: string;
   };
   index?: number;
@@ -559,7 +560,8 @@ export class ClaudeProvider extends BaseAIProvider {
             type: 'content_block_start',
             index: event.index ?? state.currentBlockIndex,
             contentBlock: {
-              type: event.content_block.type === 'tool_use' ? 'tool_use' : 'text',
+              type: event.content_block.type === 'tool_use' ? 'tool_use'
+                : event.content_block.type === 'thinking' ? 'thinking' : 'text',
               id: event.content_block.id,
               name: event.content_block.name,
             },
@@ -577,8 +579,9 @@ export class ClaudeProvider extends BaseAIProvider {
             type: 'content_block_delta',
             index: event.index ?? state.currentBlockIndex,
             delta: {
-              type: event.delta.type === 'input_json_delta' ? 'input_json_delta' : 'text_delta',
-              text: event.delta.text,
+              type: event.delta.type === 'input_json_delta' ? 'input_json_delta'
+                : event.delta.type === 'thinking_delta' ? 'thinking_delta' : 'text_delta',
+              text: event.delta.text ?? event.delta.thinking,
               partialJson: event.delta.partial_json,
             },
           });
