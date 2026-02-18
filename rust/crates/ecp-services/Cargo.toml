@@ -20,3 +20,4 @@ rand = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio-postgres = { workspace = true }
 dirs = { workspace = true }
+glob = { workspace = true }

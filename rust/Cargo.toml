@@ -81,6 +81,9 @@ portable-pty = "0.8"
 # File watching
 notify = "7"
 
+# File search
+glob = "0.3"
+
 # Secrets
 secrecy = { version = "0.10", features = ["serde"] }
 

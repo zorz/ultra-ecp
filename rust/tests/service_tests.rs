@@ -270,9 +270,9 @@ mod document {
         }))).await.unwrap();
 
         let doc_id = result["documentId"].as_str().unwrap().to_string();
-        assert_eq!(result["languageId"], "rust");
-        assert_eq!(result["lineCount"], 1);
-        assert_eq!(result["version"], 1);
+        assert_eq!(result["info"]["languageId"], "rust");
+        assert_eq!(result["info"]["lineCount"], 1);
+        assert_eq!(result["info"]["version"], 1);
 
         let content = s.handle("document/content", Some(json!({
             "documentId": doc_id,
@@ -287,7 +287,7 @@ mod document {
             "uri": "file:///tmp/test.py",
             "content": "print('hi')",
         }))).await.unwrap();
-        assert_eq!(result["languageId"], "python");
+        assert_eq!(result["info"]["languageId"], "python");
     }
 
     #[tokio::test]
@@ -412,7 +412,7 @@ mod document {
             "uri": "test://ml", "content": "line1\nline2\nline3",
         }))).await.unwrap();
         let doc_id = open["documentId"].as_str().unwrap();
-        assert_eq!(open["lineCount"], 3);
+        assert_eq!(open["info"]["lineCount"], 3);
 
         s.handle("document/insert", Some(json!({
             "documentId": doc_id,
@@ -511,7 +511,7 @@ mod document {
             "uri": "test://ver", "content": "v1",
         }))).await.unwrap();
         let doc_id = open["documentId"].as_str().unwrap();
-        assert_eq!(open["version"], 1);
+        assert_eq!(open["info"]["version"], 1);
 
         let ver = s.handle("document/version", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(ver["version"], 1);
@@ -650,7 +650,7 @@ mod file {
         assert_eq!(result["basename"], "baz.txt");
 
         let result = s.handle("file/join", Some(json!({"base": "/foo", "segments": ["bar", "baz.txt"]}))).await.unwrap();
-        assert_eq!(result["path"], "/foo/bar/baz.txt");
+        assert_eq!(result["uri"], "/foo/bar/baz.txt");
     }
 
     #[tokio::test]
@@ -922,8 +922,9 @@ mod git {
     async fn status_clean() {
         let (_tmp, s) = init_repo().await;
         let result = s.handle("git/status", None).await.unwrap();
-        assert_eq!(result["clean"], true);
-        assert_eq!(result["files"].as_array().unwrap().len(), 0);
+        assert_eq!(result["staged"].as_array().unwrap().len(), 0);
+        assert_eq!(result["unstaged"].as_array().unwrap().len(), 0);
+        assert_eq!(result["untracked"].as_array().unwrap().len(), 0);
         assert!(result["branch"].as_str().is_some());
     }
 
@@ -933,9 +934,8 @@ mod git {
         std::fs::write(tmp.path().join("new.txt"), "untracked").unwrap();
 
         let result = s.handle("git/status", None).await.unwrap();
-        assert_eq!(result["clean"], false);
-        let files = result["files"].as_array().unwrap();
-        assert!(files.len() >= 1);
+        let untracked = result["untracked"].as_array().unwrap();
+        assert!(untracked.len() >= 1);
     }
 
     #[tokio::test]
@@ -954,8 +954,8 @@ mod git {
         s.handle("git/stage", Some(json!({"paths": ["staged.txt"]}))).await.unwrap();
 
         let result = s.handle("git/commit", Some(json!({"message": "add staged.txt"}))).await.unwrap();
-        assert_eq!(result["success"], true);
-        assert!(result["output"].as_str().unwrap().contains("staged.txt"));
+        assert!(result["hash"].as_str().unwrap().len() == 40);
+        assert_eq!(result["message"], "add staged.txt");
     }
 
     #[tokio::test]
@@ -966,7 +966,7 @@ mod git {
 
         s.handle("git/stageAll", None).await.unwrap();
         let result = s.handle("git/commit", Some(json!({"message": "add all"}))).await.unwrap();
-        assert_eq!(result["success"], true);
+        assert!(result["hash"].as_str().unwrap().len() == 40);
     }
 
     #[tokio::test]
@@ -976,7 +976,8 @@ mod git {
         std::fs::write(tmp.path().join("README.md"), "# modified").unwrap();
 
         let result = s.handle("git/diff", None).await.unwrap();
-        assert!(result["diff"].as_str().unwrap().contains("modified"));
+        let hunks = result["hunks"].as_array().unwrap();
+        assert!(!hunks.is_empty());
     }
 
     #[tokio::test]
@@ -987,7 +988,8 @@ mod git {
         assert!(commits.len() >= 1);
         assert_eq!(commits[0]["message"], "init");
         assert!(commits[0]["hash"].as_str().unwrap().len() == 40);
-        assert!(commits[0]["timestamp"].as_i64().unwrap() > 0);
+        assert!(commits[0]["shortHash"].as_str().is_some());
+        assert!(commits[0]["date"].as_i64().unwrap() > 0);
     }
 
     #[tokio::test]
@@ -1002,7 +1004,7 @@ mod git {
     async fn create_and_switch_branch() {
         let (_tmp, s) = init_repo().await;
 
-        s.handle("git/createBranch", Some(json!({"name": "feature-x"}))).await.unwrap();
+        s.handle("git/createBranch", Some(json!({"name": "feature-x", "checkout": true}))).await.unwrap();
         let result = s.handle("git/branch", None).await.unwrap();
         assert_eq!(result["branch"], "feature-x");
 
@@ -1055,7 +1057,6 @@ mod terminal {
             "command": "echo hello",
         }))).await.unwrap();
 
-        assert_eq!(result["success"], true);
         assert_eq!(result["exitCode"], 0);
         assert!(result["stdout"].as_str().unwrap().contains("hello"));
     }
@@ -1068,7 +1069,6 @@ mod terminal {
         let result = s.handle("terminal/execute", Some(json!({
             "command": "exit 42",
         }))).await.unwrap();
-        assert_eq!(result["success"], false);
         assert_eq!(result["exitCode"], 42);
     }
 
@@ -1105,7 +1105,7 @@ mod terminal {
         let result = s.handle("terminal/create", Some(json!({
             "shell": "/bin/sh",
         }))).await.unwrap();
-        let term_id = result["id"].as_str().unwrap().to_string();
+        let term_id = result["terminalId"].as_str().unwrap().to_string();
         assert!(term_id.starts_with("term-"));
         assert_eq!(result["shell"], "/bin/sh");
 
@@ -1125,7 +1125,7 @@ mod terminal {
         assert_eq!(result["exists"], false);
 
         let create = s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
-        let id = create["id"].as_str().unwrap();
+        let id = create["terminalId"].as_str().unwrap();
 
         let result = s.handle("terminal/exists", Some(json!({"id": id}))).await.unwrap();
         assert_eq!(result["exists"], true);
@@ -1137,7 +1137,7 @@ mod terminal {
         let s = TerminalService::new(tmp.path().to_path_buf());
 
         let create = s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
-        let id = create["id"].as_str().unwrap();
+        let id = create["terminalId"].as_str().unwrap();
 
         let result = s.handle("terminal/close", Some(json!({"id": id}))).await.unwrap();
         assert_eq!(result["success"], true);
@@ -1165,7 +1165,6 @@ mod terminal {
 
         let result = s.handle("terminal/closeAll", None).await.unwrap();
         assert_eq!(result["success"], true);
-        assert_eq!(result["closed"], 2);
 
         let list = s.handle("terminal/list", None).await.unwrap();
         assert_eq!(list["terminals"].as_array().unwrap().len(), 0);
@@ -1177,7 +1176,7 @@ mod terminal {
         let s = TerminalService::new(tmp.path().to_path_buf());
 
         let create = s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
-        let id = create["id"].as_str().unwrap();
+        let id = create["terminalId"].as_str().unwrap();
 
         let result = s.handle("terminal/write", Some(json!({
             "id": id, "data": "echo test\n",
@@ -1191,11 +1190,11 @@ mod terminal {
         let s = TerminalService::new(tmp.path().to_path_buf());
 
         let create = s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
-        let id = create["id"].as_str().unwrap();
+        let id = create["terminalId"].as_str().unwrap();
 
-        // Buffer starts empty
+        // Buffer starts empty — now returns structured { lines, cursorRow, cursorCol }
         let result = s.handle("terminal/getBuffer", Some(json!({"id": id}))).await.unwrap();
-        assert!(result["buffer"].as_str().is_some());
+        assert!(result["buffer"]["lines"].as_array().is_some());
     }
 
     #[tokio::test]
@@ -1263,6 +1262,10 @@ mod session {
         assert_eq!(result["value"], 8);
 
         let result = s.handle("config/reset", Some(json!({"key": "editor.tabSize"}))).await.unwrap();
+        assert_eq!(result["success"], true);
+
+        // Verify it was reset to default
+        let result = s.handle("config/get", Some(json!({"key": "editor.tabSize"}))).await.unwrap();
         assert_eq!(result["value"], 4); // default
     }
 
@@ -1352,12 +1355,12 @@ mod session {
         let (_tmp, s) = svc();
 
         let result = s.handle("theme/current", None).await.unwrap();
-        assert_eq!(result["theme"], "catppuccin-mocha"); // default
+        assert_eq!(result["theme"]["id"], "catppuccin-mocha"); // default
 
         s.handle("theme/set", Some(json!({"themeId": "catppuccin-latte"}))).await.unwrap();
 
         let result = s.handle("theme/get", None).await.unwrap();
-        assert_eq!(result["theme"], "catppuccin-latte");
+        assert_eq!(result["theme"]["id"], "catppuccin-latte");
     }
 
     // ── Workspace tests ─────────────────────────────────────────────────
@@ -1367,11 +1370,11 @@ mod session {
         let (_tmp, s) = svc();
 
         let result = s.handle("workspace/getRoot", None).await.unwrap();
-        assert!(result["root"].as_str().is_some());
+        assert!(result["path"].as_str().is_some());
 
         s.handle("workspace/setRoot", Some(json!({"path": "/tmp/new-root"}))).await.unwrap();
         let result = s.handle("workspace/getRoot", None).await.unwrap();
-        assert_eq!(result["root"], "/tmp/new-root");
+        assert_eq!(result["path"], "/tmp/new-root");
     }
 
     // ── System prompt tests ─────────────────────────────────────────────
@@ -1381,12 +1384,14 @@ mod session {
         let (_tmp, s) = svc();
 
         let result = s.handle("systemPrompt/get", None).await.unwrap();
-        assert!(result["systemPrompt"].is_null()); // no default
+        assert_eq!(result["content"], ""); // empty when not set
+        assert_eq!(result["isDefault"], true);
 
         s.handle("systemPrompt/set", Some(json!({"prompt": "You are a helpful assistant"}))).await.unwrap();
 
         let result = s.handle("systemPrompt/get", None).await.unwrap();
-        assert_eq!(result["systemPrompt"], "You are a helpful assistant");
+        assert_eq!(result["content"], "You are a helpful assistant");
+        assert_eq!(result["isDefault"], false);
     }
 
     // ── Keybindings ─────────────────────────────────────────────────────
@@ -1396,7 +1401,7 @@ mod session {
         let (_tmp, s) = svc();
 
         let result = s.handle("keybindings/get", None).await.unwrap();
-        assert!(result["keybindings"].as_array().unwrap().is_empty());
+        assert!(result["bindings"].as_array().unwrap().is_empty());
     }
 
     // ── Commands ────────────────────────────────────────────────────────

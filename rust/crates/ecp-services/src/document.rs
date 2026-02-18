@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use ecp_protocol::{ECPError, HandlerResult};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::Service;
 
@@ -381,10 +381,15 @@ impl Service for DocumentService {
 
                 Ok(json!({
                     "documentId": id,
-                    "uri": uri,
-                    "languageId": lang,
-                    "lineCount": line_count,
-                    "version": version,
+                    "info": {
+                        "documentId": id,
+                        "uri": uri,
+                        "languageId": lang,
+                        "lineCount": line_count,
+                        "version": version,
+                        "isDirty": false,
+                        "isReadOnly": false,
+                    }
                 }))
             }
 
@@ -409,7 +414,7 @@ impl Service for DocumentService {
                     "lineCount": doc.line_count(),
                     "version": doc.version,
                     "isDirty": doc.is_dirty,
-                    "readOnly": doc.read_only,
+                    "isReadOnly": doc.read_only,
                 }))
             }
 
@@ -448,7 +453,7 @@ impl Service for DocumentService {
                 let text = doc.get_line(p.line)
                     .map(|s| s.to_string())
                     .unwrap_or_default();
-                Ok(json!({ "text": text, "line": p.line }))
+                Ok(json!({ "lineNumber": p.line, "text": text }))
             }
 
             "document/version" => {
@@ -465,7 +470,7 @@ impl Service for DocumentService {
                 let doc = docs.get_mut(&p.document_id)
                     .ok_or_else(|| doc_not_found(&p.document_id))?;
                 doc.insert_text(&p.position, &p.text);
-                Ok(json!({ "version": doc.version }))
+                Ok(json!({ "success": true, "version": doc.version }))
             }
 
             "document/delete" => {
@@ -474,7 +479,7 @@ impl Service for DocumentService {
                 let doc = docs.get_mut(&p.document_id)
                     .ok_or_else(|| doc_not_found(&p.document_id))?;
                 doc.delete_range(&p.range);
-                Ok(json!({ "version": doc.version }))
+                Ok(json!({ "success": true, "version": doc.version }))
             }
 
             "document/replace" => {
@@ -484,7 +489,7 @@ impl Service for DocumentService {
                     .ok_or_else(|| doc_not_found(&p.document_id))?;
                 doc.delete_range(&p.range);
                 doc.insert_text(&p.range.start, &p.text);
-                Ok(json!({ "version": doc.version }))
+                Ok(json!({ "success": true, "version": doc.version }))
             }
 
             "document/setContent" => {
@@ -497,7 +502,7 @@ impl Service for DocumentService {
                 doc.is_dirty = true;
                 doc.undo_stack.clear();
                 doc.redo_stack.clear();
-                Ok(json!({ "version": doc.version }))
+                Ok(json!({ "success": true, "version": doc.version }))
             }
 
             "document/cursors" => {
@@ -526,7 +531,8 @@ impl Service for DocumentService {
                 Ok(json!({
                     "success": cursors.is_some(),
                     "version": doc.version,
-                    "cursors": cursors,
+                    "canUndo": !doc.undo_stack.is_empty(),
+                    "canRedo": !doc.redo_stack.is_empty(),
                 }))
             }
 
@@ -539,7 +545,8 @@ impl Service for DocumentService {
                 Ok(json!({
                     "success": cursors.is_some(),
                     "version": doc.version,
-                    "cursors": cursors,
+                    "canUndo": !doc.undo_stack.is_empty(),
+                    "canRedo": !doc.redo_stack.is_empty(),
                 }))
             }
 
@@ -574,6 +581,187 @@ impl Service for DocumentService {
                     .ok_or_else(|| doc_not_found(&p.document_id))?;
                 doc.is_dirty = false;
                 Ok(json!({ "success": true }))
+            }
+
+            "document/lines" => {
+                let p: DocLinesParam = parse_params(params)?;
+                let docs = self.documents.read();
+                let doc = docs.get(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                let start = p.start_line.min(doc.lines.len());
+                let end = p.end_line.min(doc.lines.len());
+                let lines: Vec<serde_json::Value> = (start..end)
+                    .map(|i| json!({ "lineNumber": i, "text": doc.lines.get(i).unwrap_or(&String::new()) }))
+                    .collect();
+                Ok(json!({ "lines": lines }))
+            }
+
+            "document/textInRange" => {
+                let p: DocTextInRangeParam = parse_params(params)?;
+                let docs = self.documents.read();
+                let doc = docs.get(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                let text = doc.get_text_in_range(&p.range);
+                Ok(json!({ "text": text }))
+            }
+
+            "document/setCursor" => {
+                let p: DocSetCursorParam = parse_params(params)?;
+                let mut docs = self.documents.write();
+                let doc = docs.get_mut(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                doc.cursors = vec![Cursor {
+                    position: p.position,
+                    anchor: p.selection.as_ref().map(|s| s.anchor.clone()),
+                    head: p.selection.as_ref().map(|s| s.active.clone()),
+                }];
+                Ok(json!({ "success": true }))
+            }
+
+            "document/addCursor" => {
+                let p: DocAddCursorParam = parse_params(params)?;
+                let mut docs = self.documents.write();
+                let doc = docs.get_mut(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                doc.cursors.push(Cursor {
+                    position: p.position,
+                    anchor: None,
+                    head: None,
+                });
+                Ok(json!({ "success": true }))
+            }
+
+            "document/moveCursors" => {
+                let p: DocMoveCursorsParam = parse_params(params)?;
+                let mut docs = self.documents.write();
+                let doc = docs.get_mut(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                for cursor in &mut doc.cursors {
+                    match p.direction.as_str() {
+                        "up" => cursor.position.line = cursor.position.line.saturating_sub(1),
+                        "down" => cursor.position.line = (cursor.position.line + 1).min(doc.lines.len().saturating_sub(1)),
+                        "left" => cursor.position.column = cursor.position.column.saturating_sub(1),
+                        "right" => {
+                            let max_col = doc.lines.get(cursor.position.line).map(|l| l.len()).unwrap_or(0);
+                            cursor.position.column = (cursor.position.column + 1).min(max_col);
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(json!({ "success": true }))
+            }
+
+            "document/selectAll" => {
+                let p: DocIdParam = parse_params(params)?;
+                let mut docs = self.documents.write();
+                let doc = docs.get_mut(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                let last_line = doc.lines.len().saturating_sub(1);
+                let last_col = doc.lines.last().map(|l| l.len()).unwrap_or(0);
+                doc.cursors = vec![Cursor {
+                    position: Position { line: last_line, column: last_col },
+                    anchor: Some(Position { line: 0, column: 0 }),
+                    head: Some(Position { line: last_line, column: last_col }),
+                }];
+                Ok(json!({ "success": true }))
+            }
+
+            "document/clearSelections" => {
+                let p: DocIdParam = parse_params(params)?;
+                let mut docs = self.documents.write();
+                let doc = docs.get_mut(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                for cursor in &mut doc.cursors {
+                    cursor.anchor = None;
+                    cursor.head = None;
+                }
+                Ok(json!({ "success": true }))
+            }
+
+            "document/selections" => {
+                let p: DocIdParam = parse_params(params)?;
+                let docs = self.documents.read();
+                let doc = docs.get(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                let selections: Vec<String> = doc.cursors.iter()
+                    .filter(|c| c.anchor.is_some() && c.head.is_some())
+                    .filter_map(|c| {
+                        let range = Range {
+                            start: c.anchor.clone().unwrap(),
+                            end: c.head.clone().unwrap(),
+                        };
+                        Some(doc.get_text_in_range(&range))
+                    })
+                    .collect();
+                Ok(json!({ "selections": selections }))
+            }
+
+            "document/positionToOffset" => {
+                let p: DocPositionParam = parse_params(params)?;
+                let docs = self.documents.read();
+                let doc = docs.get(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                let mut offset = 0usize;
+                for (i, line) in doc.lines.iter().enumerate() {
+                    if i == p.position.line {
+                        offset += p.position.column.min(line.len());
+                        break;
+                    }
+                    offset += line.len() + 1; // +1 for newline
+                }
+                Ok(json!({ "offset": offset }))
+            }
+
+            "document/offsetToPosition" => {
+                let p: DocOffsetParam = parse_params(params)?;
+                let docs = self.documents.read();
+                let doc = docs.get(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                let mut remaining = p.offset;
+                let mut line = 0usize;
+                for (i, l) in doc.lines.iter().enumerate() {
+                    let line_len = l.len() + 1; // +1 for newline
+                    if remaining < line_len {
+                        line = i;
+                        break;
+                    }
+                    remaining -= line_len;
+                    line = i + 1;
+                }
+                Ok(json!({ "position": { "line": line, "column": remaining } }))
+            }
+
+            "document/wordAtPosition" => {
+                let p: DocPositionParam = parse_params(params)?;
+                let docs = self.documents.read();
+                let doc = docs.get(&p.document_id)
+                    .ok_or_else(|| doc_not_found(&p.document_id))?;
+                if let Some(line_text) = doc.lines.get(p.position.line) {
+                    let col = p.position.column.min(line_text.len());
+                    let chars: Vec<char> = line_text.chars().collect();
+                    if col < chars.len() && (chars[col].is_alphanumeric() || chars[col] == '_') {
+                        let mut start = col;
+                        while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+                            start -= 1;
+                        }
+                        let mut end = col;
+                        while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                            end += 1;
+                        }
+                        let word: String = chars[start..end].iter().collect();
+                        Ok(json!({
+                            "text": word,
+                            "range": {
+                                "start": { "line": p.position.line, "column": start },
+                                "end": { "line": p.position.line, "column": end },
+                            }
+                        }))
+                    } else {
+                        Ok(Value::Null)
+                    }
+                } else {
+                    Ok(Value::Null)
+                }
             }
 
             _ => Err(ECPError::method_not_found(method)),
@@ -641,6 +829,65 @@ struct DocSetCursorsParams {
     #[serde(rename = "documentId")]
     document_id: String,
     cursors: Vec<Cursor>,
+}
+
+#[derive(Deserialize)]
+struct DocLinesParam {
+    #[serde(rename = "documentId")]
+    document_id: String,
+    #[serde(rename = "startLine")]
+    start_line: usize,
+    #[serde(rename = "endLine")]
+    end_line: usize,
+}
+
+#[derive(Deserialize)]
+struct DocTextInRangeParam {
+    #[serde(rename = "documentId")]
+    document_id: String,
+    range: Range,
+}
+
+#[derive(Deserialize, Clone)]
+struct SelectionParam {
+    anchor: Position,
+    active: Position,
+}
+
+#[derive(Deserialize)]
+struct DocSetCursorParam {
+    #[serde(rename = "documentId")]
+    document_id: String,
+    position: Position,
+    selection: Option<SelectionParam>,
+}
+
+#[derive(Deserialize)]
+struct DocAddCursorParam {
+    #[serde(rename = "documentId")]
+    document_id: String,
+    position: Position,
+}
+
+#[derive(Deserialize)]
+struct DocMoveCursorsParam {
+    #[serde(rename = "documentId")]
+    document_id: String,
+    direction: String,
+}
+
+#[derive(Deserialize)]
+struct DocPositionParam {
+    #[serde(rename = "documentId")]
+    document_id: String,
+    position: Position,
+}
+
+#[derive(Deserialize)]
+struct DocOffsetParam {
+    #[serde(rename = "documentId")]
+    document_id: String,
+    offset: usize,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

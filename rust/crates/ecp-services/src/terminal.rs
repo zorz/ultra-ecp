@@ -27,10 +27,14 @@ pub struct TerminalService {
 /// Lightweight session info (the actual process is managed by spawned tasks).
 struct TerminalSessionInfo {
     id: String,
+    name: String,
     shell: String,
     cwd: String,
+    cols: u16,
+    rows: u16,
     running: bool,
     buffer: Arc<RwLock<String>>,
+    scroll_offset: usize,
     input_tx: mpsc::Sender<Vec<u8>>,
 }
 
@@ -57,6 +61,10 @@ impl TerminalService {
     pub fn set_notification_sender(&mut self, tx: mpsc::UnboundedSender<TerminalNotification>) {
         self.notification_tx = Some(tx);
     }
+
+    fn shell_name(shell: &str) -> String {
+        shell.rsplit('/').next().unwrap_or(shell).to_string()
+    }
 }
 
 impl Service for TerminalService {
@@ -74,6 +82,9 @@ impl Service for TerminalService {
                 let shell = p.shell.unwrap_or_else(|| {
                     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
                 });
+                let cols = p.cols.unwrap_or(80);
+                let rows = p.rows.unwrap_or(24);
+                let name = p.name.unwrap_or_else(|| Self::shell_name(&shell));
 
                 let id = format!("term-{}", uuid::Uuid::new_v4());
 
@@ -131,24 +142,80 @@ impl Service for TerminalService {
 
                 let info = TerminalSessionInfo {
                     id: id.clone(),
+                    name: name.clone(),
                     shell: shell.clone(),
                     cwd: cwd.clone(),
+                    cols,
+                    rows,
                     running: true,
                     buffer: buffer.clone(),
+                    scroll_offset: 0,
                     input_tx,
                 };
 
                 self.sessions.write().insert(id.clone(), Arc::new(RwLock::new(info)));
 
                 Ok(json!({
-                    "id": id,
+                    "terminalId": id,
                     "shell": shell,
                     "cwd": cwd,
                 }))
             }
 
+            "terminal/spawn" => {
+                let p: TerminalSpawnParams = parse_params(params)?;
+                let cwd = p.cwd.unwrap_or_else(|| {
+                    self.workspace_root.read().to_string_lossy().to_string()
+                });
+                let title = p.title.unwrap_or_else(|| p.command.clone());
+                let id = format!("term-{}", uuid::Uuid::new_v4());
+
+                let (input_tx, _input_rx) = mpsc::channel::<Vec<u8>>(256);
+                let buffer = Arc::new(RwLock::new(String::new()));
+
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+                let output_buffer = buffer.clone();
+                let spawn_id = id.clone();
+                let command = p.command.clone();
+                let shell_clone = shell.clone();
+
+                // Spawn command in background
+                tokio::spawn(async move {
+                    let result = Command::new(&shell_clone)
+                        .args(["-c", &command])
+                        .current_dir(&cwd)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .await;
+
+                    if let Ok(output) = result {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        output_buffer.write().push_str(&text);
+                    }
+                    debug!("Spawn task ended for {spawn_id}");
+                });
+
+                let info = TerminalSessionInfo {
+                    id: id.clone(),
+                    name: title.clone(),
+                    shell: shell.clone(),
+                    cwd: self.workspace_root.read().to_string_lossy().to_string(),
+                    cols: 80,
+                    rows: 24,
+                    running: true,
+                    buffer,
+                    scroll_offset: 0,
+                    input_tx,
+                };
+
+                self.sessions.write().insert(id.clone(), Arc::new(RwLock::new(info)));
+
+                Ok(json!({ "terminalId": id, "title": title }))
+            }
+
             "terminal/write" => {
-                let p: TerminalWriteParams = parse_params(params)?;
+                let p: TerminalIdDataParam = parse_params(params)?;
                 let tx = {
                     let sessions = self.sessions.read();
                     let session = sessions.get(&p.id)
@@ -167,8 +234,17 @@ impl Service for TerminalService {
                 let session = sessions.get(&p.id)
                     .ok_or_else(|| ECPError::server_error(format!("Terminal not found: {}", p.id)))?;
 
-                let buffer = session.read().buffer.read().clone();
-                Ok(json!({ "buffer": buffer }))
+                let raw = session.read().buffer.read().clone();
+                let lines: Vec<&str> = raw.split('\n').collect();
+                let line_count = lines.len();
+
+                Ok(json!({
+                    "buffer": {
+                        "lines": lines,
+                        "cursorRow": line_count.saturating_sub(1),
+                        "cursorCol": lines.last().map(|l| l.len()).unwrap_or(0),
+                    }
+                }))
             }
 
             "terminal/close" => {
@@ -183,9 +259,8 @@ impl Service for TerminalService {
 
             "terminal/closeAll" => {
                 let mut sessions = self.sessions.write();
-                let count = sessions.len();
                 sessions.clear();
-                Ok(json!({ "success": true, "closed": count }))
+                Ok(json!({ "success": true }))
             }
 
             "terminal/list" => {
@@ -195,8 +270,11 @@ impl Service for TerminalService {
                         let info = s.read();
                         json!({
                             "id": info.id,
+                            "name": info.name,
                             "shell": info.shell,
                             "cwd": info.cwd,
+                            "cols": info.cols,
+                            "rows": info.rows,
                             "running": info.running,
                         })
                     })
@@ -209,6 +287,70 @@ impl Service for TerminalService {
                 let p: TerminalIdParam = parse_params(params)?;
                 let exists = self.sessions.read().contains_key(&p.id);
                 Ok(json!({ "exists": exists }))
+            }
+
+            "terminal/isRunning" => {
+                let p: TerminalIdParam = parse_params(params)?;
+                let sessions = self.sessions.read();
+                let running = sessions.get(&p.id)
+                    .map(|s| s.read().running)
+                    .unwrap_or(false);
+                Ok(json!({ "running": running }))
+            }
+
+            "terminal/getInfo" => {
+                let p: TerminalIdParam = parse_params(params)?;
+                let sessions = self.sessions.read();
+                if let Some(session) = sessions.get(&p.id) {
+                    let info = session.read();
+                    Ok(json!({
+                        "info": {
+                            "id": info.id,
+                            "name": info.name,
+                            "cwd": info.cwd,
+                            "shell": info.shell,
+                            "rows": info.rows,
+                            "cols": info.cols,
+                        }
+                    }))
+                } else {
+                    Ok(json!({ "info": null }))
+                }
+            }
+
+            "terminal/resize" => {
+                let p: TerminalResizeParams = parse_params(params)?;
+                let sessions = self.sessions.read();
+                let session = sessions.get(&p.id)
+                    .ok_or_else(|| ECPError::server_error(format!("Terminal not found: {}", p.id)))?;
+                {
+                    let mut info = session.write();
+                    info.cols = p.cols;
+                    info.rows = p.rows;
+                }
+                Ok(json!({ "success": true }))
+            }
+
+            "terminal/scroll" => {
+                let p: TerminalScrollParams = parse_params(params)?;
+                let sessions = self.sessions.read();
+                let session = sessions.get(&p.id)
+                    .ok_or_else(|| ECPError::server_error(format!("Terminal not found: {}", p.id)))?;
+                {
+                    let mut info = session.write();
+                    let new_offset = info.scroll_offset as i64 + p.lines as i64;
+                    info.scroll_offset = new_offset.max(0) as usize;
+                }
+                Ok(json!({ "success": true }))
+            }
+
+            "terminal/scrollToBottom" => {
+                let p: TerminalIdParam = parse_params(params)?;
+                let sessions = self.sessions.read();
+                let session = sessions.get(&p.id)
+                    .ok_or_else(|| ECPError::server_error(format!("Terminal not found: {}", p.id)))?;
+                session.write().scroll_offset = 0;
+                Ok(json!({ "success": true }))
             }
 
             "terminal/execute" => {
@@ -229,8 +371,38 @@ impl Service for TerminalService {
                     "stdout": String::from_utf8_lossy(&output.stdout),
                     "stderr": String::from_utf8_lossy(&output.stderr),
                     "exitCode": output.status.code(),
-                    "success": output.status.success(),
                 }))
+            }
+
+            "terminal/attachTmux" => {
+                let p: TerminalAttachTmuxParams = parse_params(params)?;
+                let cols = p.cols.unwrap_or(80);
+                let rows = p.rows.unwrap_or(24);
+                let id = format!("term-{}", uuid::Uuid::new_v4());
+
+                let (input_tx, _input_rx) = mpsc::channel::<Vec<u8>>(256);
+                let buffer = Arc::new(RwLock::new(String::new()));
+
+                let mut cmd_args = vec!["attach-session".to_string(), "-t".to_string(), p.session.clone()];
+                if let Some(ref socket) = p.socket {
+                    cmd_args.insert(0, format!("-S{}", socket));
+                }
+
+                let info = TerminalSessionInfo {
+                    id: id.clone(),
+                    name: format!("tmux:{}", p.session),
+                    shell: "tmux".to_string(),
+                    cwd: self.workspace_root.read().to_string_lossy().to_string(),
+                    cols,
+                    rows,
+                    running: true,
+                    buffer,
+                    scroll_offset: 0,
+                    input_tx,
+                };
+
+                self.sessions.write().insert(id.clone(), Arc::new(RwLock::new(info)));
+                Ok(json!({ "terminalId": id }))
             }
 
             _ => Err(ECPError::method_not_found(method)),
@@ -250,17 +422,29 @@ impl Service for TerminalService {
 
 #[derive(Deserialize, Default)]
 struct TerminalCreateParams {
+    name: Option<String>,
     shell: Option<String>,
     cwd: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct TerminalSpawnParams {
+    command: String,
+    cwd: Option<String>,
+    title: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TerminalIdParam {
+    #[serde(alias = "terminalId")]
     id: String,
 }
 
 #[derive(Deserialize)]
-struct TerminalWriteParams {
+struct TerminalIdDataParam {
+    #[serde(alias = "terminalId")]
     id: String,
     data: String,
 }
@@ -269,6 +453,30 @@ struct TerminalWriteParams {
 struct TerminalExecuteParams {
     command: String,
     cwd: Option<String>,
+    timeout: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct TerminalResizeParams {
+    #[serde(alias = "terminalId")]
+    id: String,
+    cols: u16,
+    rows: u16,
+}
+
+#[derive(Deserialize)]
+struct TerminalScrollParams {
+    #[serde(alias = "terminalId")]
+    id: String,
+    lines: i32,
+}
+
+#[derive(Deserialize)]
+struct TerminalAttachTmuxParams {
+    session: String,
+    socket: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: Option<serde_json::Value>) -> Result<T, ECPError> {

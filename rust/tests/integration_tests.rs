@@ -212,8 +212,8 @@ async fn document_lifecycle_over_websocket() {
     }))).await;
     assert!(resp.get("result").is_some(), "Open should succeed: {resp}");
     let doc_id = resp["result"]["documentId"].as_str().unwrap().to_string();
-    assert_eq!(resp["result"]["languageId"], "rust");
-    assert_eq!(resp["result"]["version"], 1);
+    assert_eq!(resp["result"]["info"]["languageId"], "rust");
+    assert_eq!(resp["result"]["info"]["version"], 1);
 
     // Get content
     let resp = send_request(&mut ws, 2, "document/content", Some(json!({

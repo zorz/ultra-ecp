@@ -105,7 +105,7 @@ impl Service for SessionService {
                 let p: ConfigGetParam = parse_params(params)?;
                 let settings = self.settings.read();
                 let value = settings.get(&p.key).cloned().unwrap_or(Value::Null);
-                Ok(json!({ "key": p.key, "value": value }))
+                Ok(json!({ "value": value }))
             }
 
             "config/set" => {
@@ -120,11 +120,19 @@ impl Service for SessionService {
             }
 
             "config/reset" => {
-                let p: ConfigGetParam = parse_params(params)?;
-                let defaults = default_settings();
-                let value = defaults.get(&p.key).cloned().unwrap_or(Value::Null);
-                self.settings.write().insert(p.key.clone(), value.clone());
-                Ok(json!({ "key": p.key, "value": value }))
+                let p: ConfigResetParam = parse_params_optional(params);
+                if let Some(key) = p.key {
+                    let defaults = default_settings();
+                    let value = defaults.get(&key).cloned().unwrap_or(Value::Null);
+                    self.settings.write().insert(key, value);
+                } else {
+                    *self.settings.write() = default_settings();
+                }
+                Ok(json!({ "success": true }))
+            }
+
+            "config/schema" => {
+                Ok(json!({ "schema": config_schema() }))
             }
 
             // ── Session methods ─────────────────────────────────────────
@@ -208,12 +216,61 @@ impl Service for SessionService {
                 Ok(json!({ "session": current }))
             }
 
+            "session/setCurrent" => {
+                let p: SessionSetCurrentParam = parse_params(params)?;
+                *self.current_session.write() = Some(p.state);
+                Ok(json!({ "success": true }))
+            }
+
+            "session/markDirty" => {
+                if let Some(ref mut session) = *self.current_session.write() {
+                    session.updated_at = now_ms();
+                }
+                Ok(json!({ "success": true }))
+            }
+
+            "session/loadLast" => {
+                let sessions_dir = self.sessions_dir.read().clone();
+                let mut newest: Option<(u64, String)> = None;
+
+                if let Ok(mut entries) = tokio::fs::read_dir(&sessions_dir).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.ends_with(".json") {
+                            if let Ok(meta) = entry.metadata().await {
+                                let mtime = meta.modified().ok()
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+                                    let id = name.trim_end_matches(".json").to_string();
+                                    newest = Some((mtime, id));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some((_, id)) = newest {
+                    let path = sessions_dir.join(format!("{id}.json"));
+                    let content = tokio::fs::read_to_string(&path).await
+                        .map_err(|e| ECPError::server_error(format!("Load failed: {e}")))?;
+                    let state: SessionState = serde_json::from_str(&content)
+                        .map_err(|e| ECPError::server_error(format!("Parse error: {e}")))?;
+                    *self.current_session.write() = Some(state.clone());
+                    Ok(serde_json::to_value(&state).unwrap_or(Value::Null))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+
             // ── Theme methods ───────────────────────────────────────────
             "theme/current" | "theme/get" => {
-                let theme = self.settings.read()
+                let theme_id = self.settings.read()
                     .get("workbench.colorTheme")
-                    .cloned()
-                    .unwrap_or(Value::String("catppuccin-mocha".into()));
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "catppuccin-mocha".to_string());
+                let theme = find_theme(&theme_id);
                 Ok(json!({ "theme": theme }))
             }
 
@@ -238,7 +295,7 @@ impl Service for SessionService {
             // ── Workspace methods ───────────────────────────────────────
             "workspace/getRoot" => {
                 let root = self.workspace_root.read().to_string_lossy().to_string();
-                Ok(json!({ "root": root }))
+                Ok(json!({ "path": root }))
             }
 
             "workspace/setRoot" => {
@@ -253,7 +310,51 @@ impl Service for SessionService {
                     .get("keybindings")
                     .cloned()
                     .unwrap_or(Value::Array(Vec::new()));
-                Ok(json!({ "keybindings": bindings }))
+                Ok(json!({ "bindings": bindings }))
+            }
+
+            "keybindings/set" => {
+                let p: KeybindingsSetParam = parse_params(params)?;
+                self.settings.write().insert("keybindings".into(), Value::Array(p.bindings));
+                Ok(json!({ "success": true }))
+            }
+
+            "keybindings/add" => {
+                let p: KeybindingAddParam = parse_params(params)?;
+                let mut settings = self.settings.write();
+                let bindings = settings.entry("keybindings".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(arr) = bindings {
+                    arr.push(p.binding);
+                }
+                Ok(json!({ "success": true }))
+            }
+
+            "keybindings/remove" => {
+                let p: KeybindingRemoveParam = parse_params(params)?;
+                let mut settings = self.settings.write();
+                if let Some(Value::Array(arr)) = settings.get_mut("keybindings") {
+                    arr.retain(|b| {
+                        b.get("key").and_then(|v| v.as_str()) != Some(&p.key)
+                    });
+                }
+                Ok(json!({ "success": true }))
+            }
+
+            "keybindings/resolve" => {
+                let p: KeybindingResolveParam = parse_params(params)?;
+                let settings = self.settings.read();
+                let command = settings.get("keybindings")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find(|b| {
+                            b.get("key").and_then(|v| v.as_str()) == Some(&p.key)
+                        })
+                    })
+                    .and_then(|b| b.get("command").and_then(|v| v.as_str()))
+                    .map(|s| Value::String(s.to_string()))
+                    .unwrap_or(Value::Null);
+                Ok(json!({ "command": command }))
             }
 
             // ── Commands ────────────────────────────────────────────────
@@ -263,11 +364,15 @@ impl Service for SessionService {
 
             // ── System prompt ───────────────────────────────────────────
             "systemPrompt/get" => {
-                let prompt = self.settings.read()
-                    .get("systemPrompt")
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                Ok(json!({ "systemPrompt": prompt }))
+                let settings = self.settings.read();
+                let prompt = settings.get("systemPrompt").cloned().unwrap_or(Value::Null);
+                let is_default = prompt.is_null();
+                let content = if is_default {
+                    Value::String(String::new())
+                } else {
+                    prompt
+                };
+                Ok(json!({ "content": content, "isDefault": is_default }))
             }
 
             "systemPrompt/set" => {
@@ -292,6 +397,9 @@ struct ConfigGetParam { key: String }
 struct ConfigSetParam { key: String, value: Value }
 
 #[derive(Deserialize, Default)]
+struct ConfigResetParam { key: Option<String> }
+
+#[derive(Deserialize, Default)]
 struct SessionSaveParams { name: Option<String> }
 
 #[derive(Deserialize)]
@@ -310,7 +418,35 @@ struct ThemeSetParam {
 struct WorkspaceSetRoot { path: String }
 
 #[derive(Deserialize)]
-struct SystemPromptParam { prompt: String }
+struct SystemPromptParam {
+    #[serde(alias = "content")]
+    prompt: String,
+}
+
+#[derive(Deserialize)]
+struct SessionSetCurrentParam {
+    state: SessionState,
+}
+
+#[derive(Deserialize)]
+struct KeybindingsSetParam {
+    bindings: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct KeybindingAddParam {
+    binding: Value,
+}
+
+#[derive(Deserialize)]
+struct KeybindingRemoveParam {
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct KeybindingResolveParam {
+    key: String,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -352,6 +488,40 @@ fn default_settings() -> HashMap<String, Value> {
     s.insert("terminal.fontSize".into(), json!(13));
     s.insert("git.statusPollInterval".into(), json!(3000));
     s
+}
+
+fn find_theme(id: &str) -> Value {
+    let themes = [
+        ("catppuccin-mocha", "Catppuccin Mocha", "dark"),
+        ("catppuccin-macchiato", "Catppuccin Macchiato", "dark"),
+        ("catppuccin-frappe", "Catppuccin Frappé", "dark"),
+        ("catppuccin-latte", "Catppuccin Latte", "light"),
+    ];
+    for (tid, name, ttype) in &themes {
+        if *tid == id {
+            return json!({ "id": tid, "name": name, "type": ttype });
+        }
+    }
+    json!({ "id": id, "name": id, "type": "dark" })
+}
+
+fn config_schema() -> Value {
+    json!({
+        "editor.fontSize": { "type": "number", "default": 14, "description": "Editor font size" },
+        "editor.fontFamily": { "type": "string", "default": "SF Mono", "description": "Editor font family" },
+        "editor.tabSize": { "type": "number", "default": 4, "description": "Tab size in spaces" },
+        "editor.insertSpaces": { "type": "boolean", "default": true, "description": "Insert spaces when pressing Tab" },
+        "editor.wordWrap": { "type": "string", "default": "off", "description": "Word wrap mode" },
+        "editor.lineNumbers": { "type": "boolean", "default": true, "description": "Show line numbers" },
+        "editor.minimap": { "type": "boolean", "default": false, "description": "Show minimap" },
+        "workbench.colorTheme": { "type": "string", "default": "catppuccin-mocha", "description": "Color theme" },
+        "files.autoSave": { "type": "string", "default": "afterDelay", "description": "Auto-save mode" },
+        "files.autoSaveDelay": { "type": "number", "default": 30000, "description": "Auto-save delay in ms" },
+        "ultra.ai.model": { "type": "string", "default": "claude-sonnet-4-20250514", "description": "AI model" },
+        "terminal.shell": { "type": "string", "default": "", "description": "Terminal shell path" },
+        "terminal.fontSize": { "type": "number", "default": 13, "description": "Terminal font size" },
+        "git.statusPollInterval": { "type": "number", "default": 3000, "description": "Git status poll interval in ms" },
+    })
 }
 
 /// Strip C-style comments from JSONC content.

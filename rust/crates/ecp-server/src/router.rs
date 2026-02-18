@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use ecp_protocol::{ECPError, ECPNotification, HandlerResult};
+use ecp_protocol::{ECPError, ECPErrorCode, ECPNotification, HandlerResult};
 use ecp_services::Service;
 use ecp_transport::server::RequestHandler;
 use serde_json::Value;
@@ -149,9 +149,19 @@ impl ECPServer {
         // Find the namespace prefix
         let namespace = method.split('/').next().unwrap_or("");
 
+        // First: exact namespace match
         for service in &self.services {
             if service.namespace_dyn() == namespace {
                 return service.handle_dyn(method, params).await;
+            }
+        }
+
+        // Fallback: try all services for multi-namespace handlers
+        // (e.g. SessionService handles config/*, theme/*, workspace/*, etc.)
+        for service in &self.services {
+            match service.handle_dyn(method, params.clone()).await {
+                Err(e) if e.error_code() == ECPErrorCode::MethodNotFound => continue,
+                result => return result,
             }
         }
 
