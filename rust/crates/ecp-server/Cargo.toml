@@ -1,0 +1,17 @@
+[package]
+name = "ecp-server"
+description = "ECP server router, middleware, and workspace context"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ecp-protocol = { workspace = true }
+ecp-transport = { workspace = true }
+ecp-services = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }

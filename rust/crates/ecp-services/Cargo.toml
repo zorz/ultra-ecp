@@ -1,0 +1,18 @@
+[package]
+name = "ecp-services"
+description = "ECP service implementations (file, git, terminal, etc.)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ecp-protocol = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+notify = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }

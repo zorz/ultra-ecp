@@ -1,0 +1,15 @@
+[package]
+name = "ecp-ai-bridge"
+description = "TypeScript process bridge for AI provider SDKs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ecp-protocol = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
