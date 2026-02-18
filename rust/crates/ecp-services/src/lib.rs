@@ -4,9 +4,14 @@
 //! JSON-RPC methods. Services are registered with the ECP server router
 //! which dispatches requests by method prefix.
 
+pub mod chat;
+pub mod document;
 pub mod file;
 pub mod git;
+pub mod secret;
+pub mod session;
 pub mod terminal;
+pub mod watch;
 
 use ecp_protocol::HandlerResult;
 

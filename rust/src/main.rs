@@ -15,9 +15,14 @@ use clap::Parser;
 use ecp_protocol::auth::AuthConfig;
 use ecp_server::ECPServer;
 use ecp_services::{
+    chat::ChatService,
+    document::DocumentService,
     file::FileService,
     git::GitService,
+    secret::SecretService,
+    session::SessionService,
     terminal::TerminalService,
+    watch::WatchService,
 };
 use ecp_transport::server::{TransportConfig, TransportServer};
 use tracing::error;
@@ -97,6 +102,11 @@ async fn main() {
     ecp_server.register_service(FileService::new(workspace_root.clone()));
     ecp_server.register_service(GitService::new(workspace_root.clone()));
     ecp_server.register_service(TerminalService::new(workspace_root.clone()));
+    ecp_server.register_service(DocumentService::new());
+    ecp_server.register_service(SessionService::new(workspace_root.clone()));
+    ecp_server.register_service(SecretService::new());
+    ecp_server.register_service(ChatService::new(&workspace_root));
+    ecp_server.register_service(WatchService::new(workspace_root.clone()));
 
     // Initialize all services
     if let Err(e) = ecp_server.initialize().await {
