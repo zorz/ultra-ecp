@@ -103,6 +103,16 @@ impl TransportServer {
         handler: H,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (notification_tx, _) = broadcast::channel(1024);
+        Self::start_with_sender(config, handler, notification_tx).await
+    }
+
+    /// Start the transport server with a pre-existing broadcast channel.
+    /// Use this when services need to emit notifications before the transport starts.
+    pub async fn start_with_sender<H: RequestHandler>(
+        config: TransportConfig,
+        handler: H,
+        notification_tx: broadcast::Sender<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
         let client_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));

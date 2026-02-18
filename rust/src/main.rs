@@ -10,21 +10,26 @@
 //!   ultra-ecp --token mysecret                   # Custom auth token
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use ecp_protocol::auth::AuthConfig;
+use ecp_protocol::ECPNotification;
 use ecp_server::ECPServer;
 use ecp_services::{
     chat::ChatService,
+    database::DatabaseService,
     document::DocumentService,
     file::FileService,
     git::GitService,
+    lsp::LSPService,
     secret::SecretService,
     session::SessionService,
     terminal::TerminalService,
     watch::WatchService,
 };
 use ecp_transport::server::{TransportConfig, TransportServer};
+use tokio::sync::broadcast;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
@@ -95,8 +100,25 @@ async fn main() {
     println!("  Binding:    {} (localhost only)", cli.hostname);
     println!();
 
+    // Create shared notification channel — services and transport share this
+    let (notification_tx, _) = broadcast::channel::<String>(1024);
+
     // Create the ECP server
     let mut ecp_server = ECPServer::new(workspace_root.clone());
+    ecp_server.set_notification_sender(notification_tx.clone());
+
+    // Build a notification callback for services that emit events
+    let notify_tx = notification_tx.clone();
+    let notify_sender: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync> = Arc::new(move |method, params| {
+        let notification = ECPNotification::new(method, Some(params));
+        if let Ok(json) = serde_json::to_string(&notification) {
+            let _ = notify_tx.send(json);
+        }
+    });
+
+    // Create watch service with notification wiring
+    let watch_service = WatchService::new(workspace_root.clone());
+    watch_service.set_notify_sender(notify_sender);
 
     // Register core services
     ecp_server.register_service(FileService::new(workspace_root.clone()));
@@ -106,7 +128,9 @@ async fn main() {
     ecp_server.register_service(SessionService::new(workspace_root.clone()));
     ecp_server.register_service(SecretService::new());
     ecp_server.register_service(ChatService::new(&workspace_root));
-    ecp_server.register_service(WatchService::new(workspace_root.clone()));
+    ecp_server.register_service(DatabaseService::new(workspace_root.clone()));
+    ecp_server.register_service(LSPService::new(workspace_root.clone()));
+    ecp_server.register_service(watch_service);
 
     // Initialize all services
     if let Err(e) = ecp_server.initialize().await {
@@ -130,8 +154,8 @@ async fn main() {
         verbose_logging: cli.verbose,
     };
 
-    // Start transport server
-    let mut transport = match TransportServer::start(transport_config, ecp_server).await {
+    // Start transport server with the shared notification channel
+    let mut transport = match TransportServer::start_with_sender(transport_config, ecp_server, notification_tx).await {
         Ok(t) => t,
         Err(e) => {
             error!("Failed to start transport: {e}");
