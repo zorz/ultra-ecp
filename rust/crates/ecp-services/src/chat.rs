@@ -153,22 +153,23 @@ impl ChatDb {
 
     fn update_session(&self, id: &str, title: Option<&str>, status: Option<&str>) -> Result<bool, rusqlite::Error> {
         let now = now_ms() as i64;
-        let mut updates = vec!["updated_at = ?1"];
-        let mut idx = 2u32;
-
-        if title.is_some() { updates.push("title = ?2"); idx = 3; }
-        if status.is_some() {
-            updates.push(if idx == 2 { "status = ?2" } else { "status = ?3" });
-        }
-
-        // Build dynamic query
-        let sql = format!("UPDATE sessions SET {} WHERE id = ?{}", updates.join(", "), idx);
-
         let changed = match (title, status) {
-            (Some(t), Some(s)) => self.conn.execute(&sql, rusqlite::params![now, t, s, id])?,
-            (Some(t), None) => self.conn.execute(&format!("UPDATE sessions SET updated_at = ?1, title = ?2 WHERE id = ?3"), rusqlite::params![now, t, id])?,
-            (None, Some(s)) => self.conn.execute(&format!("UPDATE sessions SET updated_at = ?1, status = ?2 WHERE id = ?3"), rusqlite::params![now, s, id])?,
-            (None, None) => self.conn.execute(&format!("UPDATE sessions SET updated_at = ?1 WHERE id = ?2"), rusqlite::params![now, id])?,
+            (Some(t), Some(s)) => self.conn.execute(
+                "UPDATE sessions SET updated_at = ?1, title = ?2, status = ?3 WHERE id = ?4",
+                rusqlite::params![now, t, s, id],
+            )?,
+            (Some(t), None) => self.conn.execute(
+                "UPDATE sessions SET updated_at = ?1, title = ?2 WHERE id = ?3",
+                rusqlite::params![now, t, id],
+            )?,
+            (None, Some(s)) => self.conn.execute(
+                "UPDATE sessions SET updated_at = ?1, status = ?2 WHERE id = ?3",
+                rusqlite::params![now, s, id],
+            )?,
+            (None, None) => self.conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, id],
+            )?,
         };
         Ok(changed > 0)
     }

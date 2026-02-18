@@ -47,7 +47,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # WebSocket
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio-tungstenite = "0.26"
 futures-util = "0.3"
 
 # HTTP
@@ -96,6 +96,16 @@ ecp-transport = { path = "crates/ecp-transport" }
 ecp-server = { path = "crates/ecp-server" }
 ecp-services = { path = "crates/ecp-services" }
 ecp-ai-bridge = { path = "crates/ecp-ai-bridge" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ecp-protocol = { workspace = true }
+ecp-transport = { workspace = true }
+ecp-server = { workspace = true }
+ecp-services = { workspace = true }
 
 [profile.release]
 lto = true
