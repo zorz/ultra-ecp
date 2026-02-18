@@ -44,6 +44,16 @@ impl SessionService {
         }
     }
 
+    /// Create with a custom sessions directory (for testing).
+    pub fn new_with_sessions_dir(workspace_root: PathBuf, sessions_dir: PathBuf) -> Self {
+        Self {
+            workspace_root: RwLock::new(workspace_root),
+            sessions_dir: RwLock::new(sessions_dir),
+            settings: RwLock::new(default_settings()),
+            current_session: RwLock::new(None),
+        }
+    }
+
     /// Load settings from the user config file.
     async fn load_settings(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());

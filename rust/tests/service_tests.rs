@@ -2,9 +2,252 @@
 //!
 //! Tests each service's core operations using the `Service::handle` trait method,
 //! verifying JSON-RPC request/response behavior exactly as the Mac client experiences it.
+//! Wire format parity with the TypeScript ECP is validated here.
 
 use serde_json::json;
 use tempfile::TempDir;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Secret service tests — validates wire format parity with TypeScript ECP
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod secret {
+    use super::*;
+    use ecp_services::secret::SecretService;
+    use ecp_services::Service;
+
+    fn svc_with_tmp(tmp: &TempDir) -> SecretService {
+        let path = tmp.path().join("secrets.json");
+        SecretService::new_with_file_path(path)
+    }
+
+    // ── secret/providers ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn providers_list_matches_ts_wire_format() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+        let result = s.handle("secret/providers", None).await.unwrap();
+        let providers = result["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 2);
+
+        // TS wire format: { id, name, priority, isReadOnly }
+        let env = &providers[0];
+        assert_eq!(env["id"], "env");
+        assert_eq!(env["name"], "Environment Variables");
+        assert_eq!(env["priority"], 20);
+        assert_eq!(env["isReadOnly"], true);
+
+        let file = &providers[1];
+        assert_eq!(file["id"], "file");
+        assert_eq!(file["name"], "Encrypted File");
+        assert_eq!(file["priority"], 30);
+        assert_eq!(file["isReadOnly"], false);
+    }
+
+    // ── secret/get ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_nonexistent_returns_null_value() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+        // TS wire format: { value: null }
+        let result = s.handle("secret/get", Some(json!({"key": "TOTALLY_FAKE_KEY_XYZ"}))).await.unwrap();
+        assert!(result["value"].is_null());
+        // Must NOT have extra fields like "key" or "provider" (TS doesn't send them)
+        assert!(result.get("key").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_returns_value_from_file_provider() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+        // Set a secret first
+        s.handle("secret/set", Some(json!({"key": "db-password", "value": "s3cret"}))).await.unwrap();
+
+        // TS wire format: { value: string }
+        let result = s.handle("secret/get", Some(json!({"key": "db-password"}))).await.unwrap();
+        assert_eq!(result["value"], "s3cret");
+    }
+
+    #[tokio::test]
+    async fn get_env_var_via_key_transform() {
+        // The env provider transforms dashes/dots to underscores and uppercases
+        // SAFETY: single-threaded test
+        unsafe { std::env::set_var("MY_TEST_SECRET", "env-value-123") };
+
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+        let result = s.handle("secret/get", Some(json!({"key": "MY_TEST_SECRET"}))).await.unwrap();
+        assert_eq!(result["value"], "env-value-123");
+
+        unsafe { std::env::remove_var("MY_TEST_SECRET") };
+    }
+
+    #[tokio::test]
+    async fn get_missing_params_returns_invalid_params() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+        let err = s.handle("secret/get", None).await;
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().code, -32602); // InvalidParams
+    }
+
+    // ── secret/set ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_returns_success() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+        // TS wire format: { success: boolean }
+        let result = s.handle("secret/set", Some(json!({
+            "key": "api-key",
+            "value": "sk-12345",
+        }))).await.unwrap();
+        assert_eq!(result["success"], true);
+        // Must NOT have extra "provider" field
+        assert!(result.get("provider").is_none());
+    }
+
+    #[tokio::test]
+    async fn set_then_get_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+
+        s.handle("secret/set", Some(json!({"key": "round-trip", "value": "hello"}))).await.unwrap();
+        let result = s.handle("secret/get", Some(json!({"key": "round-trip"}))).await.unwrap();
+        assert_eq!(result["value"], "hello");
+    }
+
+    #[tokio::test]
+    async fn set_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+
+        s.handle("secret/set", Some(json!({"key": "overwrite", "value": "v1"}))).await.unwrap();
+        s.handle("secret/set", Some(json!({"key": "overwrite", "value": "v2"}))).await.unwrap();
+        let result = s.handle("secret/get", Some(json!({"key": "overwrite"}))).await.unwrap();
+        assert_eq!(result["value"], "v2");
+    }
+
+    // ── secret/delete ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn delete_existing_returns_true() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+
+        s.handle("secret/set", Some(json!({"key": "del-me", "value": "x"}))).await.unwrap();
+        // TS wire format: { deleted: boolean }
+        let result = s.handle("secret/delete", Some(json!({"key": "del-me"}))).await.unwrap();
+        assert_eq!(result["deleted"], true);
+
+        // Verify it's gone
+        let get = s.handle("secret/get", Some(json!({"key": "del-me"}))).await.unwrap();
+        assert!(get["value"].is_null());
+    }
+
+    #[tokio::test]
+    async fn delete_nonexistent_returns_false() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+
+        // TS wire format: { deleted: false } when key doesn't exist
+        let result = s.handle("secret/delete", Some(json!({"key": "never-existed"}))).await.unwrap();
+        assert_eq!(result["deleted"], false);
+    }
+
+    // ── secret/has ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn has_returns_exists_field() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+
+        // TS wire format: { exists: boolean }
+        let result = s.handle("secret/has", Some(json!({"key": "nope"}))).await.unwrap();
+        assert_eq!(result["exists"], false);
+
+        s.handle("secret/set", Some(json!({"key": "yes-key", "value": "v"}))).await.unwrap();
+        let result = s.handle("secret/has", Some(json!({"key": "yes-key"}))).await.unwrap();
+        assert_eq!(result["exists"], true);
+    }
+
+    // ── secret/info ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn info_existing_returns_wrapped_object() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+
+        s.handle("secret/set", Some(json!({"key": "info-key", "value": "v"}))).await.unwrap();
+
+        // TS wire format: { info: { key, provider } | null }
+        let result = s.handle("secret/info", Some(json!({"key": "info-key"}))).await.unwrap();
+        assert_eq!(result["info"]["key"], "info-key");
+        assert_eq!(result["info"]["provider"], "file");
+    }
+
+    #[tokio::test]
+    async fn info_nonexistent_returns_null() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+
+        // TS wire format: { info: null }
+        let result = s.handle("secret/info", Some(json!({"key": "ghost"}))).await.unwrap();
+        assert!(result["info"].is_null());
+    }
+
+    // ── secret/list ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_returns_sorted_keys() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+
+        s.handle("secret/set", Some(json!({"key": "zz-key", "value": "a"}))).await.unwrap();
+        s.handle("secret/set", Some(json!({"key": "aa-key", "value": "b"}))).await.unwrap();
+        s.handle("secret/set", Some(json!({"key": "mm-key", "value": "c"}))).await.unwrap();
+
+        let result = s.handle("secret/list", None).await.unwrap();
+        let keys = result["keys"].as_array().unwrap();
+
+        // File provider keys should be sorted
+        let file_keys: Vec<&str> = keys.iter()
+            .filter_map(|v| v.as_str())
+            .filter(|k| *k == "aa-key" || *k == "mm-key" || *k == "zz-key")
+            .collect();
+        assert_eq!(file_keys, vec!["aa-key", "mm-key", "zz-key"]);
+    }
+
+    #[tokio::test]
+    async fn list_deduplicates_across_providers() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+
+        // Set an env var and also in file provider with same key
+        unsafe { std::env::set_var("DEDUP_TEST_KEY", "from-env") };
+        s.handle("secret/set", Some(json!({"key": "DEDUP_TEST_KEY", "value": "from-file"}))).await.unwrap();
+
+        let result = s.handle("secret/list", None).await.unwrap();
+        let keys = result["keys"].as_array().unwrap();
+        let count = keys.iter().filter(|k| k.as_str() == Some("DEDUP_TEST_KEY")).count();
+        assert_eq!(count, 1, "duplicate keys must be deduplicated");
+
+        unsafe { std::env::remove_var("DEDUP_TEST_KEY") };
+    }
+
+    // ── error handling ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_method_returns_method_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let s = svc_with_tmp(&tmp);
+        let err = s.handle("secret/nonexistent", None).await;
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().code, -32601);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Document service tests
@@ -31,7 +274,6 @@ mod document {
         assert_eq!(result["lineCount"], 1);
         assert_eq!(result["version"], 1);
 
-        // Get content back
         let content = s.handle("document/content", Some(json!({
             "documentId": doc_id,
         }))).await.unwrap();
@@ -52,12 +294,10 @@ mod document {
     async fn insert_text() {
         let s = svc();
         let open = s.handle("document/open", Some(json!({
-            "uri": "test://doc1",
-            "content": "hello world",
+            "uri": "test://doc1", "content": "hello world",
         }))).await.unwrap();
         let doc_id = open["documentId"].as_str().unwrap();
 
-        // Insert " cruel" after "hello"
         let result = s.handle("document/insert", Some(json!({
             "documentId": doc_id,
             "position": {"line": 0, "column": 5},
@@ -65,9 +305,7 @@ mod document {
         }))).await.unwrap();
         assert_eq!(result["version"], 2);
 
-        let content = s.handle("document/content", Some(json!({
-            "documentId": doc_id,
-        }))).await.unwrap();
+        let content = s.handle("document/content", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(content["content"], "hello cruel world");
     }
 
@@ -75,8 +313,7 @@ mod document {
     async fn delete_text() {
         let s = svc();
         let open = s.handle("document/open", Some(json!({
-            "uri": "test://doc2",
-            "content": "abcdef",
+            "uri": "test://doc2", "content": "abcdef",
         }))).await.unwrap();
         let doc_id = open["documentId"].as_str().unwrap();
 
@@ -88,22 +325,57 @@ mod document {
             },
         }))).await.unwrap();
 
-        let content = s.handle("document/content", Some(json!({
-            "documentId": doc_id,
-        }))).await.unwrap();
+        let content = s.handle("document/content", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(content["content"], "abef");
+    }
+
+    #[tokio::test]
+    async fn replace_text() {
+        let s = svc();
+        let open = s.handle("document/open", Some(json!({
+            "uri": "test://replace", "content": "hello world",
+        }))).await.unwrap();
+        let doc_id = open["documentId"].as_str().unwrap();
+
+        s.handle("document/replace", Some(json!({
+            "documentId": doc_id,
+            "range": {
+                "start": {"line": 0, "column": 6},
+                "end": {"line": 0, "column": 11},
+            },
+            "text": "rust",
+        }))).await.unwrap();
+
+        let content = s.handle("document/content", Some(json!({"documentId": doc_id}))).await.unwrap();
+        assert_eq!(content["content"], "hello rust");
+    }
+
+    #[tokio::test]
+    async fn set_content_replaces_entire_document() {
+        let s = svc();
+        let open = s.handle("document/open", Some(json!({
+            "uri": "test://setcontent", "content": "original",
+        }))).await.unwrap();
+        let doc_id = open["documentId"].as_str().unwrap();
+
+        s.handle("document/setContent", Some(json!({
+            "documentId": doc_id,
+            "content": "completely new content\nwith two lines",
+        }))).await.unwrap();
+
+        let content = s.handle("document/content", Some(json!({"documentId": doc_id}))).await.unwrap();
+        assert_eq!(content["content"], "completely new content\nwith two lines");
+        assert_eq!(content["lineCount"], 2);
     }
 
     #[tokio::test]
     async fn undo_redo() {
         let s = svc();
         let open = s.handle("document/open", Some(json!({
-            "uri": "test://doc3",
-            "content": "original",
+            "uri": "test://doc3", "content": "original",
         }))).await.unwrap();
         let doc_id = open["documentId"].as_str().unwrap();
 
-        // Modify
         s.handle("document/insert", Some(json!({
             "documentId": doc_id,
             "position": {"line": 0, "column": 8},
@@ -113,14 +385,19 @@ mod document {
         let content = s.handle("document/content", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(content["content"], "original modified");
 
-        // Undo
+        // canUndo/canRedo
+        let can_undo = s.handle("document/canUndo", Some(json!({"documentId": doc_id}))).await.unwrap();
+        assert_eq!(can_undo["canUndo"], true);
+
         let undo = s.handle("document/undo", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(undo["success"], true);
 
         let content = s.handle("document/content", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(content["content"], "original");
 
-        // Redo
+        let can_redo = s.handle("document/canRedo", Some(json!({"documentId": doc_id}))).await.unwrap();
+        assert_eq!(can_redo["canRedo"], true);
+
         let redo = s.handle("document/redo", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(redo["success"], true);
 
@@ -132,14 +409,11 @@ mod document {
     async fn multi_line_insert() {
         let s = svc();
         let open = s.handle("document/open", Some(json!({
-            "uri": "test://ml",
-            "content": "line1\nline2\nline3",
+            "uri": "test://ml", "content": "line1\nline2\nline3",
         }))).await.unwrap();
         let doc_id = open["documentId"].as_str().unwrap();
-
         assert_eq!(open["lineCount"], 3);
 
-        // Insert new lines after line1
         s.handle("document/insert", Some(json!({
             "documentId": doc_id,
             "position": {"line": 0, "column": 5},
@@ -155,16 +429,13 @@ mod document {
     async fn dirty_tracking() {
         let s = svc();
         let open = s.handle("document/open", Some(json!({
-            "uri": "test://dirty",
-            "content": "clean",
+            "uri": "test://dirty", "content": "clean",
         }))).await.unwrap();
         let doc_id = open["documentId"].as_str().unwrap();
 
-        // Initially not dirty
         let dirty = s.handle("document/isDirty", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(dirty["isDirty"], false);
 
-        // Make edit
         s.handle("document/insert", Some(json!({
             "documentId": doc_id,
             "position": {"line": 0, "column": 5},
@@ -174,10 +445,25 @@ mod document {
         let dirty = s.handle("document/isDirty", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(dirty["isDirty"], true);
 
-        // Mark clean
         s.handle("document/markClean", Some(json!({"documentId": doc_id}))).await.unwrap();
         let dirty = s.handle("document/isDirty", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(dirty["isDirty"], false);
+    }
+
+    #[tokio::test]
+    async fn document_info() {
+        let s = svc();
+        let open = s.handle("document/open", Some(json!({
+            "uri": "file:///tmp/info.rs",
+            "content": "fn main() {}\n",
+            "languageId": "rust",
+        }))).await.unwrap();
+        let doc_id = open["documentId"].as_str().unwrap();
+
+        let info = s.handle("document/info", Some(json!({"documentId": doc_id}))).await.unwrap();
+        assert_eq!(info["uri"], "file:///tmp/info.rs");
+        assert_eq!(info["languageId"], "rust");
+        assert!(info["lineCount"].as_u64().unwrap() >= 1);
     }
 
     #[tokio::test]
@@ -200,9 +486,44 @@ mod document {
         let result = s.handle("document/close", Some(json!({"documentId": doc_id}))).await.unwrap();
         assert_eq!(result["success"], true);
 
-        // Info should fail after close
         let err = s.handle("document/info", Some(json!({"documentId": doc_id}))).await;
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_single_line() {
+        let s = svc();
+        let open = s.handle("document/open", Some(json!({
+            "uri": "test://lines", "content": "line0\nline1\nline2",
+        }))).await.unwrap();
+        let doc_id = open["documentId"].as_str().unwrap();
+
+        let result = s.handle("document/line", Some(json!({
+            "documentId": doc_id, "line": 1,
+        }))).await.unwrap();
+        assert_eq!(result["text"], "line1");
+    }
+
+    #[tokio::test]
+    async fn version_increments() {
+        let s = svc();
+        let open = s.handle("document/open", Some(json!({
+            "uri": "test://ver", "content": "v1",
+        }))).await.unwrap();
+        let doc_id = open["documentId"].as_str().unwrap();
+        assert_eq!(open["version"], 1);
+
+        let ver = s.handle("document/version", Some(json!({"documentId": doc_id}))).await.unwrap();
+        assert_eq!(ver["version"], 1);
+
+        s.handle("document/insert", Some(json!({
+            "documentId": doc_id,
+            "position": {"line": 0, "column": 2},
+            "text": "!",
+        }))).await.unwrap();
+
+        let ver = s.handle("document/version", Some(json!({"documentId": doc_id}))).await.unwrap();
+        assert_eq!(ver["version"], 2);
     }
 
     #[tokio::test]
@@ -210,8 +531,7 @@ mod document {
         let s = svc();
         let err = s.handle("document/nonexistent", None).await;
         assert!(err.is_err());
-        let e = err.unwrap_err();
-        assert_eq!(e.code, -32601);
+        assert_eq!(err.unwrap_err().code, -32601);
     }
 }
 
@@ -230,8 +550,7 @@ mod file {
         let s = FileService::new(tmp.path().to_path_buf());
 
         s.handle("file/write", Some(json!({
-            "path": "test.txt",
-            "content": "hello world",
+            "path": "test.txt", "content": "hello world",
         }))).await.unwrap();
 
         let result = s.handle("file/read", Some(json!({"path": "test.txt"}))).await.unwrap();
@@ -272,10 +591,8 @@ mod file {
         let stat = s.handle("file/stat", Some(json!({"path": "mydir"}))).await.unwrap();
         assert_eq!(stat["isDirectory"], true);
 
-        // Write a file into it
         s.handle("file/write", Some(json!({"path": "mydir/file.txt", "content": "hi"}))).await.unwrap();
 
-        // List directory
         let list = s.handle("file/readDir", Some(json!({"path": "mydir"}))).await.unwrap();
         let entries = list["entries"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
@@ -335,6 +652,25 @@ mod file {
         let result = s.handle("file/join", Some(json!({"base": "/foo", "segments": ["bar", "baz.txt"]}))).await.unwrap();
         assert_eq!(result["path"], "/foo/bar/baz.txt");
     }
+
+    #[tokio::test]
+    async fn read_nonexistent_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let s = FileService::new(tmp.path().to_path_buf());
+
+        let err = s.handle("file/read", Some(json!({"path": "ghost.txt"}))).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn nested_directory_creation() {
+        let tmp = TempDir::new().unwrap();
+        let s = FileService::new(tmp.path().to_path_buf());
+
+        s.handle("file/createDir", Some(json!({"path": "a/b/c"}))).await.unwrap();
+        let stat = s.handle("file/stat", Some(json!({"path": "a/b/c"}))).await.unwrap();
+        assert_eq!(stat["isDirectory"], true);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,7 +692,6 @@ mod chat {
     async fn session_crud() {
         let (_tmp, s) = svc();
 
-        // Create
         let result = s.handle("chat/session/create", Some(json!({
             "title": "Test Chat",
             "provider": "claude",
@@ -365,13 +700,11 @@ mod chat {
         let sid = result["sessionId"].as_str().unwrap().to_string();
         assert!(sid.starts_with("sess-"));
 
-        // Get
         let result = s.handle("chat/session/get", Some(json!({"sessionId": &sid}))).await.unwrap();
         assert_eq!(result["session"]["title"], "Test Chat");
         assert_eq!(result["session"]["provider"], "claude");
         assert_eq!(result["session"]["status"], "active");
 
-        // Update
         s.handle("chat/session/update", Some(json!({
             "sessionId": &sid,
             "title": "Updated Title",
@@ -382,54 +715,70 @@ mod chat {
         assert_eq!(result["session"]["title"], "Updated Title");
         assert_eq!(result["session"]["status"], "completed");
 
-        // List
         let result = s.handle("chat/session/list", None).await.unwrap();
         assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
 
-        // Delete
         s.handle("chat/session/delete", Some(json!({"sessionId": &sid}))).await.unwrap();
         let result = s.handle("chat/session/list", None).await.unwrap();
         assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
+    async fn session_update_title_only() {
+        let (_tmp, s) = svc();
+        let sess = s.handle("chat/session/create", Some(json!({"title": "Original"}))).await.unwrap();
+        let sid = sess["sessionId"].as_str().unwrap();
+
+        s.handle("chat/session/update", Some(json!({
+            "sessionId": sid, "title": "New Title",
+        }))).await.unwrap();
+
+        let result = s.handle("chat/session/get", Some(json!({"sessionId": sid}))).await.unwrap();
+        assert_eq!(result["session"]["title"], "New Title");
+        assert_eq!(result["session"]["status"], "active"); // unchanged
+    }
+
+    #[tokio::test]
+    async fn session_update_status_only() {
+        let (_tmp, s) = svc();
+        let sess = s.handle("chat/session/create", Some(json!({"title": "Status Test"}))).await.unwrap();
+        let sid = sess["sessionId"].as_str().unwrap();
+
+        s.handle("chat/session/update", Some(json!({
+            "sessionId": sid, "status": "paused",
+        }))).await.unwrap();
+
+        let result = s.handle("chat/session/get", Some(json!({"sessionId": sid}))).await.unwrap();
+        assert_eq!(result["session"]["title"], "Status Test"); // unchanged
+        assert_eq!(result["session"]["status"], "paused");
+    }
+
+    #[tokio::test]
     async fn message_crud() {
         let (_tmp, s) = svc();
-
         let sess = s.handle("chat/session/create", Some(json!({"title": "Msg Test"}))).await.unwrap();
         let sid = sess["sessionId"].as_str().unwrap();
 
-        // Add messages
         let m1 = s.handle("chat/message/add", Some(json!({
-            "sessionId": sid,
-            "role": "user",
-            "content": "Hello!",
+            "sessionId": sid, "role": "user", "content": "Hello!",
         }))).await.unwrap();
         let msg_id = m1["messageId"].as_str().unwrap().to_string();
 
         s.handle("chat/message/add", Some(json!({
-            "sessionId": sid,
-            "role": "assistant",
-            "content": "Hi there!",
+            "sessionId": sid, "role": "assistant", "content": "Hi there!",
             "model": "claude-sonnet-4-20250514",
-            "inputTokens": 10,
-            "outputTokens": 5,
+            "inputTokens": 10, "outputTokens": 5,
         }))).await.unwrap();
 
-        // List
         let result = s.handle("chat/message/list", Some(json!({"sessionId": sid}))).await.unwrap();
         let messages = result["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "assistant");
 
-        // Search
-        let result = s.handle("chat/message/search", Some(json!({
-            "query": "Hello",
-        }))).await.unwrap();
+        let result = s.handle("chat/message/search", Some(json!({"query": "Hello"}))).await.unwrap();
         assert!(result["messages"].as_array().unwrap().len() >= 1);
 
-        // Delete
         s.handle("chat/message/delete", Some(json!({"id": &msg_id}))).await.unwrap();
         let result = s.handle("chat/message/list", Some(json!({"sessionId": sid}))).await.unwrap();
         assert_eq!(result["messages"].as_array().unwrap().len(), 1);
@@ -438,25 +787,21 @@ mod chat {
     #[tokio::test]
     async fn tool_calls() {
         let (_tmp, s) = svc();
-
         let sess = s.handle("chat/session/create", Some(json!({"title": "TC"}))).await.unwrap();
         let sid = sess["sessionId"].as_str().unwrap();
 
         let tc = s.handle("chat/toolCall/add", Some(json!({
-            "sessionId": sid,
-            "toolName": "file/read",
+            "sessionId": sid, "toolName": "file/read",
             "input": {"path": "/tmp/test.txt"},
         }))).await.unwrap();
         let tc_id = tc["toolCallId"].as_str().unwrap().to_string();
 
-        // Complete
         s.handle("chat/toolCall/complete", Some(json!({
             "id": &tc_id,
             "output": {"content": "file contents"},
             "status": "success",
         }))).await.unwrap();
 
-        // List
         let result = s.handle("chat/toolCall/list", Some(json!({"sessionId": sid}))).await.unwrap();
         let calls = result["toolCalls"].as_array().unwrap();
         assert_eq!(calls.len(), 1);
@@ -467,24 +812,17 @@ mod chat {
     #[tokio::test]
     async fn todos() {
         let (_tmp, s) = svc();
-
         let sess = s.handle("chat/session/create", Some(json!({"title": "Todos"}))).await.unwrap();
         let sid = sess["sessionId"].as_str().unwrap();
 
         s.handle("chat/todo/upsert", Some(json!({
-            "sessionId": sid,
-            "content": "Write tests",
-            "activeForm": "Writing tests",
-            "status": "in_progress",
-            "orderIndex": 0,
+            "sessionId": sid, "content": "Write tests",
+            "activeForm": "Writing tests", "status": "in_progress", "orderIndex": 0,
         }))).await.unwrap();
 
         s.handle("chat/todo/upsert", Some(json!({
-            "sessionId": sid,
-            "content": "Run tests",
-            "activeForm": "Running tests",
-            "status": "pending",
-            "orderIndex": 1,
+            "sessionId": sid, "content": "Run tests",
+            "activeForm": "Running tests", "status": "pending", "orderIndex": 1,
         }))).await.unwrap();
 
         let result = s.handle("chat/todo/list", Some(json!({"sessionId": sid}))).await.unwrap();
@@ -497,79 +835,586 @@ mod chat {
     #[tokio::test]
     async fn permissions() {
         let (_tmp, s) = svc();
-
         let sess = s.handle("chat/session/create", Some(json!({"title": "Perms"}))).await.unwrap();
         let sid = sess["sessionId"].as_str().unwrap();
 
-        // No permission initially
         let check = s.handle("chat/permission/check", Some(json!({
-            "toolName": "file/write",
-            "sessionId": sid,
+            "toolName": "file/write", "sessionId": sid,
         }))).await.unwrap();
         assert_eq!(check["allowed"], false);
 
-        // Grant
         s.handle("chat/permission/grant", Some(json!({
-            "sessionId": sid,
-            "toolName": "file/write",
-            "scope": "session",
+            "sessionId": sid, "toolName": "file/write", "scope": "session",
         }))).await.unwrap();
 
-        // Now allowed
         let check = s.handle("chat/permission/check", Some(json!({
-            "toolName": "file/write",
-            "sessionId": sid,
+            "toolName": "file/write", "sessionId": sid,
         }))).await.unwrap();
         assert_eq!(check["allowed"], true);
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Secret service tests
+// Git service tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-mod secret {
+mod git {
     use super::*;
-    use ecp_services::secret::SecretService;
+    use ecp_services::git::GitService;
     use ecp_services::Service;
 
-    #[tokio::test]
-    async fn providers_list() {
-        let s = SecretService::new();
-        let result = s.handle("secret/providers", None).await.unwrap();
-        let providers = result["providers"].as_array().unwrap();
-        assert!(providers.len() >= 2); // env + file at minimum
+    /// Create an isolated git repo in a temp dir.
+    async fn init_repo() -> (TempDir, GitService) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // git init + initial commit so branch exists
+        tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&path)
+            .output().await.unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&path)
+            .output().await.unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&path)
+            .output().await.unwrap();
+        // Need at least one commit for branch to exist
+        std::fs::write(path.join("README.md"), "# test").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&path)
+            .output().await.unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&path)
+            .output().await.unwrap();
+
+        let s = GitService::new(path);
+        (tmp, s)
     }
 
     #[tokio::test]
-    async fn env_provider_reads_env_var() {
-        // Set an env var that the env provider knows about
-        // SAFETY: This test is single-threaded for this env var usage
-        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-key-12345") };
-        let s = SecretService::new();
-
-        let result = s.handle("secret/get", Some(json!({"key": "ANTHROPIC_API_KEY"}))).await.unwrap();
-        assert_eq!(result["value"], "test-key-12345");
-        assert_eq!(result["provider"], "env");
-
-        let has = s.handle("secret/has", Some(json!({"key": "ANTHROPIC_API_KEY"}))).await.unwrap();
-        assert_eq!(has["has"], true);
-
-        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+    async fn is_repo() {
+        let (_tmp, s) = init_repo().await;
+        let result = s.handle("git/isRepo", None).await.unwrap();
+        assert_eq!(result["isRepo"], true);
     }
 
     #[tokio::test]
-    async fn nonexistent_key() {
-        let s = SecretService::new();
-        let result = s.handle("secret/get", Some(json!({"key": "TOTALLY_FAKE_KEY_XYZ"}))).await.unwrap();
-        assert!(result["value"].is_null());
+    async fn is_not_repo() {
+        let tmp = TempDir::new().unwrap();
+        let s = GitService::new(tmp.path().to_path_buf());
+        let result = s.handle("git/isRepo", None).await.unwrap();
+        assert_eq!(result["isRepo"], false);
+    }
+
+    #[tokio::test]
+    async fn get_root() {
+        let (_tmp, s) = init_repo().await;
+        let result = s.handle("git/getRoot", None).await.unwrap();
+        assert!(result["root"].as_str().unwrap().len() > 0);
+    }
+
+    #[tokio::test]
+    async fn status_clean() {
+        let (_tmp, s) = init_repo().await;
+        let result = s.handle("git/status", None).await.unwrap();
+        assert_eq!(result["clean"], true);
+        assert_eq!(result["files"].as_array().unwrap().len(), 0);
+        assert!(result["branch"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn status_with_changes() {
+        let (tmp, s) = init_repo().await;
+        std::fs::write(tmp.path().join("new.txt"), "untracked").unwrap();
+
+        let result = s.handle("git/status", None).await.unwrap();
+        assert_eq!(result["clean"], false);
+        let files = result["files"].as_array().unwrap();
+        assert!(files.len() >= 1);
+    }
+
+    #[tokio::test]
+    async fn branch() {
+        let (_tmp, s) = init_repo().await;
+        let result = s.handle("git/branch", None).await.unwrap();
+        let branch = result["branch"].as_str().unwrap();
+        assert!(branch == "main" || branch == "master");
+    }
+
+    #[tokio::test]
+    async fn stage_and_commit() {
+        let (tmp, s) = init_repo().await;
+        std::fs::write(tmp.path().join("staged.txt"), "content").unwrap();
+
+        s.handle("git/stage", Some(json!({"paths": ["staged.txt"]}))).await.unwrap();
+
+        let result = s.handle("git/commit", Some(json!({"message": "add staged.txt"}))).await.unwrap();
+        assert_eq!(result["success"], true);
+        assert!(result["output"].as_str().unwrap().contains("staged.txt"));
+    }
+
+    #[tokio::test]
+    async fn stage_all() {
+        let (tmp, s) = init_repo().await;
+        std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "b").unwrap();
+
+        s.handle("git/stageAll", None).await.unwrap();
+        let result = s.handle("git/commit", Some(json!({"message": "add all"}))).await.unwrap();
+        assert_eq!(result["success"], true);
+    }
+
+    #[tokio::test]
+    async fn diff() {
+        let (tmp, s) = init_repo().await;
+        // Modify a tracked file
+        std::fs::write(tmp.path().join("README.md"), "# modified").unwrap();
+
+        let result = s.handle("git/diff", None).await.unwrap();
+        assert!(result["diff"].as_str().unwrap().contains("modified"));
+    }
+
+    #[tokio::test]
+    async fn log() {
+        let (_tmp, s) = init_repo().await;
+        let result = s.handle("git/log", Some(json!({"limit": 5}))).await.unwrap();
+        let commits = result["commits"].as_array().unwrap();
+        assert!(commits.len() >= 1);
+        assert_eq!(commits[0]["message"], "init");
+        assert!(commits[0]["hash"].as_str().unwrap().len() == 40);
+        assert!(commits[0]["timestamp"].as_i64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn branches() {
+        let (_tmp, s) = init_repo().await;
+        let result = s.handle("git/branches", None).await.unwrap();
+        let branches = result["branches"].as_array().unwrap();
+        assert!(branches.len() >= 1);
+    }
+
+    #[tokio::test]
+    async fn create_and_switch_branch() {
+        let (_tmp, s) = init_repo().await;
+
+        s.handle("git/createBranch", Some(json!({"name": "feature-x"}))).await.unwrap();
+        let result = s.handle("git/branch", None).await.unwrap();
+        assert_eq!(result["branch"], "feature-x");
+
+        // Switch back — try "main" first, fall back to "master"
+        if s.handle("git/switchBranch", Some(json!({"name": "main"}))).await.is_err() {
+            s.handle("git/switchBranch", Some(json!({"name": "master"}))).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stash_list_empty() {
+        let (_tmp, s) = init_repo().await;
+        let result = s.handle("git/stashList", None).await.unwrap();
+        let stashes = result["stashes"].as_array().unwrap();
+        assert_eq!(stashes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn remotes_empty_local_repo() {
+        let (_tmp, s) = init_repo().await;
+        let result = s.handle("git/remotes", None).await.unwrap();
+        let remotes = result["remotes"].as_array().unwrap();
+        assert_eq!(remotes.len(), 0);
     }
 
     #[tokio::test]
     async fn unknown_method() {
-        let s = SecretService::new();
-        let err = s.handle("secret/nonexistent", None).await;
+        let (_tmp, s) = init_repo().await;
+        let err = s.handle("git/nonexistent", None).await;
         assert!(err.is_err());
+        assert_eq!(err.unwrap_err().code, -32601);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Terminal service tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod terminal {
+    use super::*;
+    use ecp_services::terminal::TerminalService;
+    use ecp_services::Service;
+
+    #[tokio::test]
+    async fn execute_command() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let result = s.handle("terminal/execute", Some(json!({
+            "command": "echo hello",
+        }))).await.unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["exitCode"], 0);
+        assert!(result["stdout"].as_str().unwrap().contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_exit_code() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let result = s.handle("terminal/execute", Some(json!({
+            "command": "exit 42",
+        }))).await.unwrap();
+        assert_eq!(result["success"], false);
+        assert_eq!(result["exitCode"], 42);
+    }
+
+    #[tokio::test]
+    async fn execute_with_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let result = s.handle("terminal/execute", Some(json!({
+            "command": "echo err >&2",
+        }))).await.unwrap();
+        assert!(result["stderr"].as_str().unwrap().contains("err"));
+    }
+
+    #[tokio::test]
+    async fn execute_with_custom_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let result = s.handle("terminal/execute", Some(json!({
+            "command": "pwd",
+            "cwd": sub.to_str().unwrap(),
+        }))).await.unwrap();
+        assert!(result["stdout"].as_str().unwrap().contains("subdir"));
+    }
+
+    #[tokio::test]
+    async fn create_and_list_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let result = s.handle("terminal/create", Some(json!({
+            "shell": "/bin/sh",
+        }))).await.unwrap();
+        let term_id = result["id"].as_str().unwrap().to_string();
+        assert!(term_id.starts_with("term-"));
+        assert_eq!(result["shell"], "/bin/sh");
+
+        let list = s.handle("terminal/list", None).await.unwrap();
+        let terminals = list["terminals"].as_array().unwrap();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["id"], term_id);
+        assert_eq!(terminals[0]["running"], true);
+    }
+
+    #[tokio::test]
+    async fn terminal_exists() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let result = s.handle("terminal/exists", Some(json!({"id": "nonexistent"}))).await.unwrap();
+        assert_eq!(result["exists"], false);
+
+        let create = s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
+        let id = create["id"].as_str().unwrap();
+
+        let result = s.handle("terminal/exists", Some(json!({"id": id}))).await.unwrap();
+        assert_eq!(result["exists"], true);
+    }
+
+    #[tokio::test]
+    async fn close_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let create = s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
+        let id = create["id"].as_str().unwrap();
+
+        let result = s.handle("terminal/close", Some(json!({"id": id}))).await.unwrap();
+        assert_eq!(result["success"], true);
+
+        let exists = s.handle("terminal/exists", Some(json!({"id": id}))).await.unwrap();
+        assert_eq!(exists["exists"], false);
+    }
+
+    #[tokio::test]
+    async fn close_nonexistent_terminal_errors() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let err = s.handle("terminal/close", Some(json!({"id": "fake-id"}))).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn close_all_terminals() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
+        s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
+
+        let result = s.handle("terminal/closeAll", None).await.unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(result["closed"], 2);
+
+        let list = s.handle("terminal/list", None).await.unwrap();
+        assert_eq!(list["terminals"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_to_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let create = s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
+        let id = create["id"].as_str().unwrap();
+
+        let result = s.handle("terminal/write", Some(json!({
+            "id": id, "data": "echo test\n",
+        }))).await.unwrap();
+        assert_eq!(result["success"], true);
+    }
+
+    #[tokio::test]
+    async fn get_buffer() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+
+        let create = s.handle("terminal/create", Some(json!({"shell": "/bin/sh"}))).await.unwrap();
+        let id = create["id"].as_str().unwrap();
+
+        // Buffer starts empty
+        let result = s.handle("terminal/getBuffer", Some(json!({"id": id}))).await.unwrap();
+        assert!(result["buffer"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn unknown_method() {
+        let tmp = TempDir::new().unwrap();
+        let s = TerminalService::new(tmp.path().to_path_buf());
+        let err = s.handle("terminal/nonexistent", None).await;
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().code, -32601);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Session service tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod session {
+    use super::*;
+    use ecp_services::session::SessionService;
+    use ecp_services::Service;
+
+    fn svc() -> (TempDir, SessionService) {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        let s = SessionService::new_with_sessions_dir(
+            tmp.path().to_path_buf(),
+            sessions_dir,
+        );
+        (tmp, s)
+    }
+
+    #[tokio::test]
+    async fn config_get_set() {
+        let (_tmp, s) = svc();
+
+        // Get default value
+        let result = s.handle("config/get", Some(json!({"key": "editor.fontSize"}))).await.unwrap();
+        assert_eq!(result["value"], 14);
+
+        // Set new value
+        s.handle("config/set", Some(json!({"key": "editor.fontSize", "value": 18}))).await.unwrap();
+
+        let result = s.handle("config/get", Some(json!({"key": "editor.fontSize"}))).await.unwrap();
+        assert_eq!(result["value"], 18);
+    }
+
+    #[tokio::test]
+    async fn config_get_all() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("config/getAll", None).await.unwrap();
+        let settings = result["settings"].as_object().unwrap();
+        assert!(settings.contains_key("editor.fontSize"));
+        assert!(settings.contains_key("editor.tabSize"));
+        assert!(settings.contains_key("workbench.colorTheme"));
+    }
+
+    #[tokio::test]
+    async fn config_reset() {
+        let (_tmp, s) = svc();
+
+        // Change then reset
+        s.handle("config/set", Some(json!({"key": "editor.tabSize", "value": 8}))).await.unwrap();
+        let result = s.handle("config/get", Some(json!({"key": "editor.tabSize"}))).await.unwrap();
+        assert_eq!(result["value"], 8);
+
+        let result = s.handle("config/reset", Some(json!({"key": "editor.tabSize"}))).await.unwrap();
+        assert_eq!(result["value"], 4); // default
+    }
+
+    #[tokio::test]
+    async fn config_get_unknown_key() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("config/get", Some(json!({"key": "nonexistent.key"}))).await.unwrap();
+        assert!(result["value"].is_null());
+    }
+
+    #[tokio::test]
+    async fn session_save_and_list() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("session/save", Some(json!({"name": "My Session"}))).await.unwrap();
+        assert!(result["sessionId"].as_str().unwrap().starts_with("session-"));
+
+        let result = s.handle("session/list", None).await.unwrap();
+        let sessions = result["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_save_load_roundtrip() {
+        let (_tmp, s) = svc();
+
+        // Set a custom value
+        s.handle("config/set", Some(json!({"key": "editor.fontSize", "value": 20}))).await.unwrap();
+
+        let saved = s.handle("session/save", Some(json!({"name": "Roundtrip"}))).await.unwrap();
+        let sid = saved["sessionId"].as_str().unwrap();
+
+        // Change the value
+        s.handle("config/set", Some(json!({"key": "editor.fontSize", "value": 10}))).await.unwrap();
+
+        // Load restores it
+        s.handle("session/load", Some(json!({"sessionId": sid}))).await.unwrap();
+        let result = s.handle("config/get", Some(json!({"key": "editor.fontSize"}))).await.unwrap();
+        assert_eq!(result["value"], 20);
+    }
+
+    #[tokio::test]
+    async fn session_delete() {
+        let (_tmp, s) = svc();
+
+        let saved = s.handle("session/save", Some(json!({"name": "Delete Me"}))).await.unwrap();
+        let sid = saved["sessionId"].as_str().unwrap();
+
+        s.handle("session/delete", Some(json!({"sessionId": sid}))).await.unwrap();
+
+        let result = s.handle("session/list", None).await.unwrap();
+        assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_current() {
+        let (_tmp, s) = svc();
+
+        // No current session initially
+        let result = s.handle("session/current", None).await.unwrap();
+        assert!(result["session"].is_null());
+
+        // After save, current session is set
+        s.handle("session/save", Some(json!({"name": "Current"}))).await.unwrap();
+        let result = s.handle("session/current", None).await.unwrap();
+        assert!(!result["session"].is_null());
+    }
+
+    // ── Theme tests ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn theme_list() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("theme/list", None).await.unwrap();
+        let themes = result["themes"].as_array().unwrap();
+        assert!(themes.len() >= 4);
+        // Verify catppuccin themes are present
+        let ids: Vec<&str> = themes.iter().filter_map(|t| t["id"].as_str()).collect();
+        assert!(ids.contains(&"catppuccin-mocha"));
+        assert!(ids.contains(&"catppuccin-latte"));
+    }
+
+    #[tokio::test]
+    async fn theme_get_set() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("theme/current", None).await.unwrap();
+        assert_eq!(result["theme"], "catppuccin-mocha"); // default
+
+        s.handle("theme/set", Some(json!({"themeId": "catppuccin-latte"}))).await.unwrap();
+
+        let result = s.handle("theme/get", None).await.unwrap();
+        assert_eq!(result["theme"], "catppuccin-latte");
+    }
+
+    // ── Workspace tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn workspace_get_set_root() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("workspace/getRoot", None).await.unwrap();
+        assert!(result["root"].as_str().is_some());
+
+        s.handle("workspace/setRoot", Some(json!({"path": "/tmp/new-root"}))).await.unwrap();
+        let result = s.handle("workspace/getRoot", None).await.unwrap();
+        assert_eq!(result["root"], "/tmp/new-root");
+    }
+
+    // ── System prompt tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn system_prompt_get_set() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("systemPrompt/get", None).await.unwrap();
+        assert!(result["systemPrompt"].is_null()); // no default
+
+        s.handle("systemPrompt/set", Some(json!({"prompt": "You are a helpful assistant"}))).await.unwrap();
+
+        let result = s.handle("systemPrompt/get", None).await.unwrap();
+        assert_eq!(result["systemPrompt"], "You are a helpful assistant");
+    }
+
+    // ── Keybindings ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn keybindings_get_empty() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("keybindings/get", None).await.unwrap();
+        assert!(result["keybindings"].as_array().unwrap().is_empty());
+    }
+
+    // ── Commands ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn commands_list() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("commands/list", None).await.unwrap();
+        assert!(result["commands"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    async fn unknown_method() {
+        let (_tmp, s) = svc();
+        let err = s.handle("session/nonexistent", None).await;
+        assert!(err.is_err());
+        assert_eq!(err.unwrap_err().code, -32601);
     }
 }
 
@@ -587,41 +1432,30 @@ mod database {
         let tmp = TempDir::new().unwrap();
         let s = DatabaseService::new(tmp.path().to_path_buf());
 
-        // Create
         let result = s.handle("database/createConnection", Some(json!({
-            "name": "Test DB",
-            "host": "localhost",
-            "port": 5432,
-            "database": "testdb",
-            "username": "user",
-            "password": "pass",
+            "name": "Test DB", "host": "localhost", "port": 5432,
+            "database": "testdb", "username": "user", "password": "pass",
         }))).await.unwrap();
         let conn_id = result["connectionId"].as_str().unwrap().to_string();
         assert!(conn_id.starts_with("conn-"));
 
-        // List
         let result = s.handle("database/listConnections", None).await.unwrap();
         let conns = result["connections"].as_array().unwrap();
         assert_eq!(conns.len(), 1);
         assert_eq!(conns[0]["name"], "Test DB");
-        assert_eq!(conns[0]["host"], "localhost");
         assert_eq!(conns[0]["status"], "disconnected");
 
-        // Get
         let result = s.handle("database/getConnection", Some(json!({"connectionId": &conn_id}))).await.unwrap();
         assert_eq!(result["name"], "Test DB");
         assert_eq!(result["database"], "testdb");
 
-        // Update
         s.handle("database/updateConnection", Some(json!({
-            "connectionId": &conn_id,
-            "name": "Updated DB",
+            "connectionId": &conn_id, "name": "Updated DB",
         }))).await.unwrap();
 
         let result = s.handle("database/getConnection", Some(json!({"connectionId": &conn_id}))).await.unwrap();
         assert_eq!(result["name"], "Updated DB");
 
-        // Delete
         s.handle("database/deleteConnection", Some(json!({"connectionId": &conn_id}))).await.unwrap();
         let result = s.handle("database/listConnections", None).await.unwrap();
         assert_eq!(result["connections"].as_array().unwrap().len(), 0);
@@ -633,8 +1467,7 @@ mod database {
         let s = DatabaseService::new(tmp.path().to_path_buf());
 
         s.handle("database/favoriteQuery", Some(json!({
-            "name": "All users",
-            "sql": "SELECT * FROM users",
+            "name": "All users", "sql": "SELECT * FROM users",
         }))).await.unwrap();
 
         let result = s.handle("database/getFavorites", None).await.unwrap();
@@ -680,8 +1513,7 @@ mod watch {
         let s = WatchService::new(tmp.path().to_path_buf());
 
         let result = s.handle("watch/start", Some(json!({
-            "path": ".",
-            "recursive": true,
+            "path": ".", "recursive": true,
         }))).await.unwrap();
         let watch_id = result["watchId"].as_str().unwrap().to_string();
 

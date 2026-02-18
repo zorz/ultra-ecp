@@ -14,11 +14,11 @@ use crate::Service;
 trait SecretProvider: Send + Sync {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
-    fn is_available(&self) -> bool;
+    fn priority(&self) -> u32;
     fn is_writable(&self) -> bool;
     fn get(&self, key: &str) -> Option<String>;
     fn set(&self, key: &str, value: &str) -> Result<(), String>;
-    fn delete(&self, key: &str) -> Result<(), String>;
+    fn delete(&self, key: &str) -> Result<bool, String>;
     fn list(&self) -> Vec<String>;
 }
 
@@ -28,7 +28,7 @@ struct EnvProvider;
 impl SecretProvider for EnvProvider {
     fn id(&self) -> &str { "env" }
     fn name(&self) -> &str { "Environment Variables" }
-    fn is_available(&self) -> bool { true }
+    fn priority(&self) -> u32 { 20 }
     fn is_writable(&self) -> bool { false }
     fn get(&self, key: &str) -> Option<String> {
         // Map common secret keys to env vars
@@ -37,8 +37,8 @@ impl SecretProvider for EnvProvider {
             "openai-api-key" => "OPENAI_API_KEY",
             "gemini-api-key" => "GEMINI_API_KEY",
             _ => {
-                // Try direct env var name (uppercase, dashes to underscores)
-                let upper = key.replace('-', "_").to_uppercase();
+                // Try direct env var name (uppercase, dashes/dots to underscores)
+                let upper = key.replace('-', "_").replace('.', "_").to_uppercase();
                 return std::env::var(&upper).ok();
             }
         };
@@ -47,11 +47,10 @@ impl SecretProvider for EnvProvider {
     fn set(&self, _key: &str, _value: &str) -> Result<(), String> {
         Err("Environment provider is read-only".into())
     }
-    fn delete(&self, _key: &str) -> Result<(), String> {
+    fn delete(&self, _key: &str) -> Result<bool, String> {
         Err("Environment provider is read-only".into())
     }
     fn list(&self) -> Vec<String> {
-        // Return known API key env vars that are set
         let mut keys = Vec::new();
         for key in &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"] {
             if std::env::var(key).is_ok() {
@@ -98,7 +97,7 @@ impl FileProvider {
 impl SecretProvider for FileProvider {
     fn id(&self) -> &str { "file" }
     fn name(&self) -> &str { "Encrypted File" }
-    fn is_available(&self) -> bool { true }
+    fn priority(&self) -> u32 { 30 }
     fn is_writable(&self) -> bool { true }
     fn get(&self, key: &str) -> Option<String> {
         self.cache.read().get(key).cloned()
@@ -108,13 +107,15 @@ impl SecretProvider for FileProvider {
         self.save();
         Ok(())
     }
-    fn delete(&self, key: &str) -> Result<(), String> {
-        self.cache.write().remove(key);
-        self.save();
-        Ok(())
+    fn delete(&self, key: &str) -> Result<bool, String> {
+        let removed = self.cache.write().remove(key).is_some();
+        if removed { self.save(); }
+        Ok(removed)
     }
     fn list(&self) -> Vec<String> {
-        self.cache.read().keys().cloned().collect()
+        let mut keys: Vec<String> = self.cache.read().keys().cloned().collect();
+        keys.sort();
+        keys
     }
 }
 
@@ -132,6 +133,19 @@ impl SecretService {
             ],
         }
     }
+
+    /// Create with a custom file provider path (for testing).
+    pub fn new_with_file_path(secrets_path: PathBuf) -> Self {
+        Self {
+            providers: vec![
+                Box::new(EnvProvider),
+                Box::new(FileProvider {
+                    path: secrets_path,
+                    cache: RwLock::new(HashMap::new()),
+                }),
+            ],
+        }
+    }
 }
 
 impl Service for SecretService {
@@ -141,46 +155,45 @@ impl Service for SecretService {
 
     async fn handle(&self, method: &str, params: Option<Value>) -> HandlerResult {
         match method {
+            // TS wire format: { value: string | null }
             "secret/get" => {
                 let p: SecretKeyParam = parse_params(params)?;
                 for provider in &self.providers {
                     if let Some(value) = provider.get(&p.key) {
-                        return Ok(json!({
-                            "key": p.key,
-                            "value": value,
-                            "provider": provider.id(),
-                        }));
+                        return Ok(json!({ "value": value }));
                     }
                 }
-                Ok(json!({ "key": p.key, "value": null }))
+                Ok(json!({ "value": null }))
             }
 
+            // TS wire format: { success: boolean }
             "secret/set" => {
                 let p: SecretSetParam = parse_params(params)?;
-                // Write to first writable provider
                 for provider in &self.providers {
                     if provider.is_writable() {
                         provider.set(&p.key, &p.value)
                             .map_err(|e| ECPError::server_error(e))?;
-                        return Ok(json!({
-                            "success": true,
-                            "provider": provider.id(),
-                        }));
+                        return Ok(json!({ "success": true }));
                     }
                 }
                 Err(ECPError::server_error("No writable secret provider available"))
             }
 
+            // TS wire format: { deleted: boolean }
             "secret/delete" => {
                 let p: SecretKeyParam = parse_params(params)?;
+                let mut deleted = false;
                 for provider in &self.providers {
                     if provider.is_writable() {
-                        let _ = provider.delete(&p.key);
+                        if let Ok(true) = provider.delete(&p.key) {
+                            deleted = true;
+                        }
                     }
                 }
-                Ok(json!({ "success": true }))
+                Ok(json!({ "deleted": deleted }))
             }
 
+            // TS wire format: { keys: string[] }
             "secret/list" => {
                 let mut all_keys = Vec::new();
                 for provider in &self.providers {
@@ -190,37 +203,41 @@ impl Service for SecretService {
                         }
                     }
                 }
+                all_keys.sort();
                 Ok(json!({ "keys": all_keys }))
             }
 
+            // TS wire format: { exists: boolean }
             "secret/has" => {
                 let p: SecretKeyParam = parse_params(params)?;
-                let has = self.providers.iter().any(|prov| prov.get(&p.key).is_some());
-                Ok(json!({ "has": has }))
+                let exists = self.providers.iter().any(|prov| prov.get(&p.key).is_some());
+                Ok(json!({ "exists": exists }))
             }
 
+            // TS wire format: { info: { key, provider, ... } | null }
             "secret/info" => {
                 let p: SecretKeyParam = parse_params(params)?;
                 for provider in &self.providers {
                     if provider.get(&p.key).is_some() {
                         return Ok(json!({
-                            "key": p.key,
-                            "exists": true,
-                            "provider": provider.id(),
-                            "providerName": provider.name(),
+                            "info": {
+                                "key": p.key,
+                                "provider": provider.id(),
+                            }
                         }));
                     }
                 }
-                Ok(json!({ "key": p.key, "exists": false }))
+                Ok(json!({ "info": null }))
             }
 
+            // TS wire format: { providers: [{ id, name, priority, isReadOnly }] }
             "secret/providers" => {
                 let providers: Vec<Value> = self.providers.iter().map(|p| {
                     json!({
                         "id": p.id(),
                         "name": p.name(),
-                        "available": p.is_available(),
-                        "writable": p.is_writable(),
+                        "priority": p.priority(),
+                        "isReadOnly": !p.is_writable(),
                     })
                 }).collect();
                 Ok(json!({ "providers": providers }))
