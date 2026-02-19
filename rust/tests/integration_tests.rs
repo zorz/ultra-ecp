@@ -5,27 +5,42 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Start a test server on a random port and return (port, auth_token).
 async fn start_test_server() -> (u16, String) {
+    start_test_server_with_services(false).await
+}
+
+/// Start a test server with optional extra services.
+async fn start_test_server_with_services(full: bool) -> (u16, String) {
     use ecp_protocol::auth::AuthConfig;
     use ecp_server::ECPServer;
     use ecp_services::{
+        chat::ChatService,
         document::DocumentService,
         file::FileService,
+        session::SessionService,
     };
     use ecp_transport::server::{TransportConfig, TransportServer};
 
-    let workspace = std::env::temp_dir().join("ecp-integration-test");
-    let _ = std::fs::create_dir_all(&workspace);
+    let workspace = TempDir::new().unwrap();
+    // Leak the TempDir so it persists for the test duration
+    let workspace_path = Box::leak(Box::new(workspace)).path().to_path_buf();
 
-    let auth_token = "test-integration-token-12345".to_string();
+    let auth_token = format!("test-token-{}", std::process::id());
 
-    let mut ecp_server = ECPServer::new(workspace.clone());
-    ecp_server.register_service(FileService::new(workspace.clone()));
+    let mut ecp_server = ECPServer::new(workspace_path.clone());
+    ecp_server.register_service(FileService::new(workspace_path.clone()));
     ecp_server.register_service(DocumentService::new());
+
+    if full {
+        ecp_server.register_service(ChatService::new(&workspace_path));
+        ecp_server.register_service(SessionService::new(workspace_path.clone()));
+    }
+
     ecp_server.initialize().await.unwrap();
 
     let config = TransportConfig {
@@ -39,7 +54,7 @@ async fn start_test_server() -> (u16, String) {
         }),
         enable_cors: false,
         max_connections: Some(16),
-        workspace_root: Some(workspace.to_string_lossy().to_string()),
+        workspace_root: Some(workspace_path.to_string_lossy().to_string()),
         verbose_logging: false,
     };
 
@@ -346,4 +361,150 @@ async fn health_endpoint_works() {
     assert!(resp.status().is_success());
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chat service integration tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn chat_session_lifecycle_over_websocket() {
+    let (port, token) = start_test_server_with_services(true).await;
+    let mut ws = connect_and_auth(port, &token).await;
+
+    // Create a chat session
+    let resp = send_request(&mut ws, 1, "chat/session/create", Some(json!({
+        "title": "Integration test session"
+    }))).await;
+    assert!(resp.get("result").is_some(), "Create should succeed: {resp}");
+    let session_id = resp["result"]["id"].as_str().unwrap().to_string();
+
+    // Add a message (content is stored as a serialized JSON string)
+    let content = serde_json::to_string(&json!([{ "type": "text", "text": "Hello from integration test" }])).unwrap();
+    let resp = send_request(&mut ws, 2, "chat/message/add", Some(json!({
+        "sessionId": &session_id,
+        "role": "user",
+        "content": content,
+    }))).await;
+    assert!(resp.get("result").is_some(), "Add message should succeed: {resp}");
+    let msg_id = resp["result"]["messageId"].as_str().unwrap().to_string();
+
+    // List messages
+    let resp = send_request(&mut ws, 3, "chat/message/list", Some(json!({
+        "sessionId": &session_id
+    }))).await;
+    let messages = resp["result"].as_array().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["id"], msg_id);
+
+    // Get session
+    let resp = send_request(&mut ws, 4, "chat/session/get", Some(json!({
+        "sessionId": &session_id
+    }))).await;
+    assert!(resp.get("result").is_some(), "Get should succeed: {resp}");
+    assert_eq!(resp["result"]["session"]["title"], "Integration test session");
+
+    // Update session
+    let resp = send_request(&mut ws, 5, "chat/session/update", Some(json!({
+        "sessionId": &session_id,
+        "title": "Updated title"
+    }))).await;
+    assert_eq!(resp["result"]["success"], true);
+
+    // Delete session
+    let resp = send_request(&mut ws, 6, "chat/session/delete", Some(json!({
+        "sessionId": &session_id
+    }))).await;
+    assert_eq!(resp["result"]["success"], true);
+}
+
+#[tokio::test]
+async fn chat_document_lifecycle_over_websocket() {
+    let (port, token) = start_test_server_with_services(true).await;
+    let mut ws = connect_and_auth(port, &token).await;
+
+    // Create a session first (documents need a session)
+    let resp = send_request(&mut ws, 1, "chat/session/create", Some(json!({
+        "title": "Doc test session"
+    }))).await;
+    let session_id = resp["result"]["id"].as_str().unwrap().to_string();
+
+    // Create a document — returns full document
+    let resp = send_request(&mut ws, 2, "chat/document/create", Some(json!({
+        "sessionId": &session_id,
+        "title": "Test Document",
+        "docType": "spec",
+        "content": "fn main() {}",
+    }))).await;
+    assert!(resp.get("result").is_some(), "Create doc should succeed: {resp}");
+    let doc_id = resp["result"]["id"].as_str().unwrap().to_string();
+    assert_eq!(resp["result"]["title"], "Test Document");
+
+    // Get document — returns raw document (not wrapped)
+    let resp = send_request(&mut ws, 3, "chat/document/get", Some(json!({
+        "id": &doc_id
+    }))).await;
+    assert!(resp.get("result").is_some(), "Get doc should succeed: {resp}");
+    assert_eq!(resp["result"]["content"], "fn main() {}");
+    assert_eq!(resp["result"]["docType"], "spec");
+
+    // Update document — returns full updated document
+    let resp = send_request(&mut ws, 4, "chat/document/update", Some(json!({
+        "id": &doc_id,
+        "content": "fn main() { println!(\"hello\"); }"
+    }))).await;
+    assert_eq!(resp["result"]["title"], "Test Document");
+    assert!(resp["result"]["content"].as_str().unwrap().contains("println"));
+
+    // List documents
+    let resp = send_request(&mut ws, 5, "chat/document/list", Some(json!({
+        "sessionId": &session_id
+    }))).await;
+    let docs = resp["result"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["title"], "Test Document");
+
+    // Search documents
+    let resp = send_request(&mut ws, 6, "chat/document/search", Some(json!({
+        "query": "hello"
+    }))).await;
+    let results = resp["result"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+
+    // Delete document
+    let resp = send_request(&mut ws, 7, "chat/document/delete", Some(json!({
+        "id": &doc_id
+    }))).await;
+    assert_eq!(resp["result"]["success"], true);
+
+    // Verify deleted
+    let resp = send_request(&mut ws, 8, "chat/document/list", Some(json!({
+        "sessionId": &session_id
+    }))).await;
+    let docs = resp["result"].as_array().unwrap();
+    assert_eq!(docs.len(), 0);
+}
+
+#[tokio::test]
+async fn bridge_services_return_not_started_without_bridge() {
+    // Without the bridge running, AI/auth/agent/workflow/syntax namespace methods
+    // should return MethodNotFound since no bridge services are registered
+    let (port, token) = start_test_server().await;
+    let mut ws = connect_and_auth(port, &token).await;
+
+    let resp = send_request(&mut ws, 1, "ai/models/list", None).await;
+    assert!(resp.get("error").is_some(), "Should be error: {resp}");
+    assert_eq!(resp["error"]["code"], -32601); // MethodNotFound
+
+    let resp = send_request(&mut ws, 2, "auth/status", None).await;
+    assert!(resp.get("error").is_some());
+    assert_eq!(resp["error"]["code"], -32601);
+
+    let resp = send_request(&mut ws, 3, "agent/list", None).await;
+    assert!(resp.get("error").is_some());
+    assert_eq!(resp["error"]["code"], -32601);
+
+    let resp = send_request(&mut ws, 4, "syntax/highlight", None).await;
+    assert!(resp.get("error").is_some());
+    assert_eq!(resp["error"]["code"], -32601);
 }

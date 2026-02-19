@@ -72,18 +72,25 @@ impl WatchService {
             while let Some(event) = event_rx.recv().await {
                 if let Some(ref tx) = notify_tx {
                     for path in &event.paths {
-                        let path_str = path.to_string_lossy().to_string();
-                        let (method, kind_str) = match event.kind {
-                            EventKind::Create(_) => ("file/didCreate", "create"),
-                            EventKind::Modify(_) => ("file/didChange", "change"),
-                            EventKind::Remove(_) => ("file/didDelete", "delete"),
+                        let uri = path.to_string_lossy().to_string();
+                        // Match TypeScript ECP: didCreate/didDelete send { uri },
+                        // didChange sends full event { uri, type, timestamp }
+                        match event.kind {
+                            EventKind::Create(_) => {
+                                tx("file/didCreate", json!({ "uri": uri }));
+                            }
+                            EventKind::Remove(_) => {
+                                tx("file/didDelete", json!({ "uri": uri }));
+                            }
+                            EventKind::Modify(_) => {
+                                tx("file/didChange", json!({
+                                    "uri": uri,
+                                    "type": "changed",
+                                    "timestamp": now_ms(),
+                                }));
+                            }
                             _ => continue,
                         };
-                        tx(method, json!({
-                            "path": path_str,
-                            "kind": kind_str,
-                            "timestamp": now_ms(),
-                        }));
                     }
                 }
             }
@@ -182,6 +189,8 @@ impl Service for WatchService {
 
 #[derive(Deserialize)]
 struct WatchParams {
+    /// Accepts both "uri" (TypeScript ECP) and "path" (legacy)
+    #[serde(alias = "uri")]
     path: String,
     recursive: Option<bool>,
 }

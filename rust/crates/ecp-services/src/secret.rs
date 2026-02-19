@@ -61,8 +61,7 @@ impl SecretProvider for EnvProvider {
     }
 }
 
-/// File-based provider — stores secrets in an encrypted-at-rest JSON file.
-/// For now uses a simple JSON file; encryption can be added later.
+/// File-based provider — stores secrets in a JSON file at ~/.ultra/secrets.json.
 struct FileProvider {
     path: PathBuf,
     cache: RwLock<HashMap<String, String>>,
@@ -96,7 +95,7 @@ impl FileProvider {
 
 impl SecretProvider for FileProvider {
     fn id(&self) -> &str { "file" }
-    fn name(&self) -> &str { "Encrypted File" }
+    fn name(&self) -> &str { "File" }
     fn priority(&self) -> u32 { 30 }
     fn is_writable(&self) -> bool { true }
     fn get(&self, key: &str) -> Option<String> {

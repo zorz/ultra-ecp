@@ -40,7 +40,7 @@ mod secret {
 
         let file = &providers[1];
         assert_eq!(file["id"], "file");
-        assert_eq!(file["name"], "Encrypted File");
+        assert_eq!(file["name"], "File");
         assert_eq!(file["priority"], 30);
         assert_eq!(file["isReadOnly"], false);
     }
@@ -697,7 +697,7 @@ mod chat {
             "provider": "claude",
             "model": "claude-sonnet-4-20250514",
         }))).await.unwrap();
-        let sid = result["sessionId"].as_str().unwrap().to_string();
+        let sid = result["id"].as_str().unwrap().to_string();
         assert!(sid.starts_with("sess-"));
 
         let result = s.handle("chat/session/get", Some(json!({"sessionId": &sid}))).await.unwrap();
@@ -716,18 +716,18 @@ mod chat {
         assert_eq!(result["session"]["status"], "completed");
 
         let result = s.handle("chat/session/list", None).await.unwrap();
-        assert_eq!(result["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(result.as_array().unwrap().len(), 1);
 
         s.handle("chat/session/delete", Some(json!({"sessionId": &sid}))).await.unwrap();
         let result = s.handle("chat/session/list", None).await.unwrap();
-        assert_eq!(result["sessions"].as_array().unwrap().len(), 0);
+        assert_eq!(result.as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
     async fn session_update_title_only() {
         let (_tmp, s) = svc();
         let sess = s.handle("chat/session/create", Some(json!({"title": "Original"}))).await.unwrap();
-        let sid = sess["sessionId"].as_str().unwrap();
+        let sid = sess["id"].as_str().unwrap();
 
         s.handle("chat/session/update", Some(json!({
             "sessionId": sid, "title": "New Title",
@@ -742,7 +742,7 @@ mod chat {
     async fn session_update_status_only() {
         let (_tmp, s) = svc();
         let sess = s.handle("chat/session/create", Some(json!({"title": "Status Test"}))).await.unwrap();
-        let sid = sess["sessionId"].as_str().unwrap();
+        let sid = sess["id"].as_str().unwrap();
 
         s.handle("chat/session/update", Some(json!({
             "sessionId": sid, "status": "paused",
@@ -757,7 +757,7 @@ mod chat {
     async fn message_crud() {
         let (_tmp, s) = svc();
         let sess = s.handle("chat/session/create", Some(json!({"title": "Msg Test"}))).await.unwrap();
-        let sid = sess["sessionId"].as_str().unwrap();
+        let sid = sess["id"].as_str().unwrap();
 
         let m1 = s.handle("chat/message/add", Some(json!({
             "sessionId": sid, "role": "user", "content": "Hello!",
@@ -771,24 +771,24 @@ mod chat {
         }))).await.unwrap();
 
         let result = s.handle("chat/message/list", Some(json!({"sessionId": sid}))).await.unwrap();
-        let messages = result["messages"].as_array().unwrap();
+        let messages = result.as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[1]["role"], "assistant");
 
         let result = s.handle("chat/message/search", Some(json!({"query": "Hello"}))).await.unwrap();
-        assert!(result["messages"].as_array().unwrap().len() >= 1);
+        assert!(result.as_array().unwrap().len() >= 1);
 
         s.handle("chat/message/delete", Some(json!({"id": &msg_id}))).await.unwrap();
         let result = s.handle("chat/message/list", Some(json!({"sessionId": sid}))).await.unwrap();
-        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(result.as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn tool_calls() {
         let (_tmp, s) = svc();
         let sess = s.handle("chat/session/create", Some(json!({"title": "TC"}))).await.unwrap();
-        let sid = sess["sessionId"].as_str().unwrap();
+        let sid = sess["id"].as_str().unwrap();
 
         let tc = s.handle("chat/toolCall/add", Some(json!({
             "sessionId": sid, "toolName": "file/read",
@@ -803,7 +803,7 @@ mod chat {
         }))).await.unwrap();
 
         let result = s.handle("chat/toolCall/list", Some(json!({"sessionId": sid}))).await.unwrap();
-        let calls = result["toolCalls"].as_array().unwrap();
+        let calls = result.as_array().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["toolName"], "file/read");
         assert_eq!(calls[0]["status"], "success");
@@ -813,30 +813,46 @@ mod chat {
     async fn todos() {
         let (_tmp, s) = svc();
         let sess = s.handle("chat/session/create", Some(json!({"title": "Todos"}))).await.unwrap();
-        let sid = sess["sessionId"].as_str().unwrap();
+        let sid = sess["id"].as_str().unwrap();
 
-        s.handle("chat/todo/upsert", Some(json!({
+        // Upsert returns full todo object (matches TypeScript)
+        let todo1 = s.handle("chat/todo/upsert", Some(json!({
             "sessionId": sid, "content": "Write tests",
             "activeForm": "Writing tests", "status": "in_progress", "orderIndex": 0,
         }))).await.unwrap();
+        assert_eq!(todo1["content"], "Write tests");
+        assert_eq!(todo1["status"], "in_progress");
+        assert_eq!(todo1["activeForm"], "Writing tests");
+        let todo1_id = todo1["id"].as_str().unwrap().to_string();
 
-        s.handle("chat/todo/upsert", Some(json!({
+        let todo2 = s.handle("chat/todo/upsert", Some(json!({
             "sessionId": sid, "content": "Run tests",
             "activeForm": "Running tests", "status": "pending", "orderIndex": 1,
         }))).await.unwrap();
+        assert_eq!(todo2["content"], "Run tests");
 
+        // List todos
         let result = s.handle("chat/todo/list", Some(json!({"sessionId": sid}))).await.unwrap();
-        let todos = result["todos"].as_array().unwrap();
+        let todos = result.as_array().unwrap();
         assert_eq!(todos.len(), 2);
         assert_eq!(todos[0]["content"], "Write tests");
         assert_eq!(todos[0]["status"], "in_progress");
+
+        // Get single todo by ID
+        let result = s.handle("chat/todo/get", Some(json!({"id": todo1_id}))).await.unwrap();
+        assert_eq!(result["content"], "Write tests");
+        assert_eq!(result["sessionId"], sid);
+
+        // Get nonexistent todo returns null
+        let result = s.handle("chat/todo/get", Some(json!({"id": "todo-missing"}))).await.unwrap();
+        assert!(result.is_null());
     }
 
     #[tokio::test]
     async fn permissions() {
         let (_tmp, s) = svc();
         let sess = s.handle("chat/session/create", Some(json!({"title": "Perms"}))).await.unwrap();
-        let sid = sess["sessionId"].as_str().unwrap();
+        let sid = sess["id"].as_str().unwrap();
 
         let check = s.handle("chat/permission/check", Some(json!({
             "toolName": "file/write", "sessionId": sid,
@@ -851,6 +867,293 @@ mod chat {
             "toolName": "file/write", "sessionId": sid,
         }))).await.unwrap();
         assert_eq!(check["allowed"], true);
+    }
+
+    async fn create_test_session(s: &ChatService) -> String {
+        let result = s.handle("chat/session/create", Some(json!({
+            "title": "Test", "provider": "claude", "model": "claude-sonnet-4-20250514",
+        }))).await.unwrap();
+        result["id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn document_crud() {
+        let (_tmp, s) = svc();
+        let sid = create_test_session(&s).await;
+
+        // Create document — returns full document (matches TypeScript)
+        let result = s.handle("chat/document/create", Some(json!({
+            "sessionId": sid,
+            "title": "test.rs",
+            "docType": "spec",
+            "content": "fn main() {}",
+        }))).await.unwrap();
+        let doc_id = result["id"].as_str().unwrap().to_string();
+        assert!(doc_id.starts_with("doc-"));
+        assert_eq!(result["title"], "test.rs");
+        assert_eq!(result["docType"], "spec");
+        assert_eq!(result["status"], "draft");
+
+        // Get document — returns raw document (not wrapped)
+        let result = s.handle("chat/document/get", Some(json!({ "id": doc_id }))).await.unwrap();
+        assert_eq!(result["title"], "test.rs");
+        assert_eq!(result["docType"], "spec");
+        assert_eq!(result["content"], "fn main() {}");
+        assert_eq!(result["sessionId"], sid);
+
+        // Get nonexistent document — returns null (not error)
+        let result = s.handle("chat/document/get", Some(json!({ "id": "doc-nonexistent" }))).await.unwrap();
+        assert!(result.is_null());
+
+        // Update document — returns full updated document
+        let result = s.handle("chat/document/update", Some(json!({
+            "id": doc_id,
+            "content": "fn main() { println!(\"hello\"); }",
+            "title": "main.rs",
+            "priority": 5,
+            "reviewStatus": "pending",
+        }))).await.unwrap();
+        assert_eq!(result["title"], "main.rs");
+        assert!(result["content"].as_str().unwrap().contains("println"));
+        assert_eq!(result["priority"], 5);
+        assert_eq!(result["reviewStatus"], "pending");
+
+        // Update nonexistent — returns null
+        let result = s.handle("chat/document/update", Some(json!({
+            "id": "doc-nonexistent", "title": "nope",
+        }))).await.unwrap();
+        assert!(result.is_null());
+
+        // List documents
+        let result = s.handle("chat/document/list", Some(json!({ "sessionId": sid }))).await.unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 1);
+
+        // List with filters
+        let result = s.handle("chat/document/list", Some(json!({
+            "sessionId": sid, "reviewStatus": "pending",
+        }))).await.unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 1);
+
+        // Search documents by content
+        let result = s.handle("chat/document/search", Some(json!({
+            "query": "println",
+        }))).await.unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 1);
+
+        // Search with docType filter
+        let result = s.handle("chat/document/search", Some(json!({
+            "query": "println", "docType": "note",
+        }))).await.unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 0); // wrong type
+
+        // Delete document
+        let result = s.handle("chat/document/delete", Some(json!({ "id": doc_id }))).await.unwrap();
+        assert_eq!(result["success"], true);
+
+        // Verify deleted
+        let result = s.handle("chat/document/list", Some(json!({ "sessionId": sid }))).await.unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn document_hierarchy_and_count() {
+        let (_tmp, s) = svc();
+        let sid = create_test_session(&s).await;
+
+        // Create parent document
+        let r1 = s.handle("chat/document/create", Some(json!({
+            "sessionId": sid, "title": "README.md", "docType": "note",
+        }))).await.unwrap();
+        let parent_id = r1["id"].as_str().unwrap().to_string();
+
+        // Create child documents
+        s.handle("chat/document/create", Some(json!({
+            "sessionId": sid, "title": "api.ts", "docType": "spec", "parentId": parent_id,
+        }))).await.unwrap();
+        s.handle("chat/document/create", Some(json!({
+            "sessionId": sid, "title": "utils.ts", "docType": "spec", "parentId": parent_id,
+        }))).await.unwrap();
+
+        // Hierarchy — takes root document ID, returns nested structure
+        let result = s.handle("chat/document/hierarchy", Some(json!({ "id": parent_id }))).await.unwrap();
+        assert_eq!(result["id"], parent_id);
+        assert_eq!(result["title"], "README.md");
+        let children = result["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().any(|c| c["title"] == "api.ts"));
+        assert!(children.iter().any(|c| c["title"] == "utils.ts"));
+
+        // Hierarchy for nonexistent doc — returns null
+        let result = s.handle("chat/document/hierarchy", Some(json!({ "id": "doc-missing" }))).await.unwrap();
+        assert!(result.is_null());
+
+        // Count by type — global, no params required, returns { docType: count }
+        let result = s.handle("chat/document/count-by-type", None).await.unwrap();
+        assert_eq!(result["note"], 1);
+        assert_eq!(result["spec"], 2);
+
+        // Vulnerabilities — proper filtering
+        s.handle("chat/document/create", Some(json!({
+            "sessionId": sid, "title": "XSS vuln", "docType": "vulnerability",
+            "severity": "high", "status": "active",
+        }))).await.unwrap();
+        s.handle("chat/document/create", Some(json!({
+            "sessionId": sid, "title": "Old vuln", "docType": "vulnerability",
+            "severity": "low", "status": "archived",
+        }))).await.unwrap();
+        let result = s.handle("chat/document/vulnerabilities", None).await.unwrap();
+        let vulns = result.as_array().unwrap();
+        assert_eq!(vulns.len(), 1); // archived is excluded
+        assert_eq!(vulns[0]["title"], "XSS vuln");
+
+        // Pending reviews — create returns full doc with id
+        let review_doc = s.handle("chat/document/create", Some(json!({
+            "sessionId": sid, "title": "Review me", "docType": "spec",
+        }))).await.unwrap();
+        let review_id = review_doc["id"].as_str().unwrap().to_string();
+        s.handle("chat/document/update", Some(json!({
+            "id": review_id, "reviewStatus": "pending",
+        }))).await.unwrap();
+        let result = s.handle("chat/document/pending-reviews", None).await.unwrap();
+        let reviews = result.as_array().unwrap();
+        assert!(reviews.iter().any(|r| r["title"] == "Review me"));
+    }
+
+    #[tokio::test]
+    async fn activity_reconstructed_from_data() {
+        let (_tmp, s) = svc();
+        let sid = create_test_session(&s).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap()
+            .as_millis() as i64;
+
+        // Add a message (will show as message_added activity)
+        s.handle("chat/message/add", Some(json!({
+            "sessionId": sid, "role": "user", "content": "Hello!",
+        }))).await.unwrap();
+
+        // Add a tool call (will show as tool_call_started activity)
+        s.handle("chat/toolCall/add", Some(json!({
+            "sessionId": sid, "toolName": "file/read",
+            "input": { "path": "/tmp/test.txt" },
+        }))).await.unwrap();
+
+        // chat/activity/log returns reconstructed activity (session_created + message + tool_call)
+        let result = s.handle("chat/activity/log", Some(json!({
+            "sessionId": sid,
+        }))).await.unwrap();
+        let activities = result.as_array().unwrap();
+        assert!(activities.len() >= 3, "Expected at least 3 entries (session + message + tool call), got {}", activities.len());
+
+        // Verify types are present
+        let types: Vec<&str> = activities.iter().filter_map(|a| a["activityType"].as_str()).collect();
+        assert!(types.contains(&"session_created"));
+        assert!(types.contains(&"message_added"));
+        assert!(types.contains(&"tool_call_started"));
+
+        // chat/activity/since with recent timestamp should include our entries
+        let result = s.handle("chat/activity/since", Some(json!({
+            "since": now - 5000,
+            "sessionId": sid,
+        }))).await.unwrap();
+        assert!(result.as_array().unwrap().len() >= 3);
+
+        // chat/activity/add is a no-op
+        let result = s.handle("chat/activity/add", None).await.unwrap();
+        assert_eq!(result["success"], true);
+    }
+
+    #[tokio::test]
+    async fn stats_and_context() {
+        let (_tmp, s) = svc();
+        let sid = create_test_session(&s).await;
+
+        // Add some data
+        s.handle("chat/message/add", Some(json!({
+            "sessionId": sid, "role": "user", "content": "hello",
+        }))).await.unwrap();
+        s.handle("chat/document/create", Some(json!({
+            "sessionId": sid, "title": "doc.md", "docType": "note",
+        }))).await.unwrap();
+
+        // Global stats
+        let result = s.handle("chat/stats", None).await.unwrap();
+        assert!(result["stats"]["sessions"].as_i64().unwrap() >= 1);
+        assert!(result["stats"]["messages"].as_i64().unwrap() >= 1);
+        assert!(result["stats"]["documents"].as_i64().unwrap() >= 1);
+
+        // Session stats
+        let result = s.handle("chat/stats", Some(json!({ "sessionId": sid }))).await.unwrap();
+        assert_eq!(result["stats"]["messages"], 1);
+        assert_eq!(result["stats"]["documents"], 1);
+
+        // Context build
+        let result = s.handle("chat/context/build", Some(json!({ "sessionId": sid }))).await.unwrap();
+        assert_eq!(result["sessionId"], sid);
+        assert!(result["context"]["session"].is_object());
+        assert!(result["context"]["messages"].is_array());
+        assert!(result["context"]["documents"].is_array());
+    }
+
+    #[tokio::test]
+    async fn compaction_get_expand_collapse() {
+        let (_tmp, s) = svc();
+        let sid = create_test_session(&s).await;
+
+        // Add messages
+        let m1 = s.handle("chat/message/add", Some(json!({
+            "sessionId": sid, "role": "user", "content": "first",
+        }))).await.unwrap();
+        let m1_id = m1["messageId"].as_str().unwrap();
+        let m2 = s.handle("chat/message/add", Some(json!({
+            "sessionId": sid, "role": "assistant", "content": "second",
+        }))).await.unwrap();
+        let m2_id = m2["messageId"].as_str().unwrap();
+
+        // Create compaction
+        let result = s.handle("chat/compaction/create", Some(json!({
+            "sessionId": sid,
+            "summary": "User asked, assistant replied",
+            "startMessageId": m1_id,
+            "endMessageId": m2_id,
+            "messagesCompacted": 2,
+        }))).await.unwrap();
+        let cmp_id = result["compactionId"].as_str().unwrap().to_string();
+
+        // Get compaction
+        let result = s.handle("chat/compaction/get", Some(json!({ "id": cmp_id }))).await.unwrap();
+        assert_eq!(result["compaction"]["messagesCompacted"], 2);
+
+        // Expand (marks compacted messages as active)
+        s.handle("chat/compaction/expand", Some(json!({ "id": cmp_id }))).await.unwrap();
+
+        // Collapse (marks messages as inactive)
+        s.handle("chat/compaction/collapse", Some(json!({ "id": cmp_id }))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn todo_replace() {
+        let (_tmp, s) = svc();
+        let sid = create_test_session(&s).await;
+
+        // Create initial todos
+        s.handle("chat/todo/upsert", Some(json!({
+            "sessionId": sid, "content": "old task", "status": "pending",
+        }))).await.unwrap();
+
+        // Replace all todos — returns the new todo list (matches TypeScript)
+        let result = s.handle("chat/todo/replace", Some(json!({
+            "sessionId": sid,
+            "todos": [
+                { "content": "new task 1", "status": "pending" },
+                { "content": "new task 2", "status": "in_progress" },
+            ],
+        }))).await.unwrap();
+        let todos = result.as_array().unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0]["content"], "new task 1");
+        assert_eq!(todos[1]["content"], "new task 2");
+        assert_eq!(todos[1]["status"], "in_progress");
     }
 }
 
@@ -1356,11 +1659,15 @@ mod session {
 
         let result = s.handle("theme/current", None).await.unwrap();
         assert_eq!(result["theme"]["id"], "catppuccin-mocha"); // default
+        // Verify full theme data is loaded (colors and tokenColors)
+        assert!(result["theme"]["colors"].is_object(), "theme should have colors object");
+        assert!(result["theme"]["tokenColors"].is_array(), "theme should have tokenColors array");
 
         s.handle("theme/set", Some(json!({"themeId": "catppuccin-latte"}))).await.unwrap();
 
         let result = s.handle("theme/get", None).await.unwrap();
         assert_eq!(result["theme"]["id"], "catppuccin-latte");
+        assert_eq!(result["theme"]["type"], "light"); // latte is the light theme
     }
 
     // ── Workspace tests ─────────────────────────────────────────────────
@@ -1412,6 +1719,16 @@ mod session {
 
         let result = s.handle("commands/list", None).await.unwrap();
         assert!(result["commands"].as_array().is_some());
+    }
+
+    // ── Models (moved to ModelsService) ─────────────────────────────
+
+    #[tokio::test]
+    async fn models_not_handled_by_session() {
+        let (_tmp, s) = svc();
+        // models/list is now handled by ModelsService, not SessionService
+        let result = s.handle("models/list", None).await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -1530,5 +1847,106 @@ mod watch {
 
         let list = s.handle("watch/list", None).await.unwrap();
         assert_eq!(list["watches"].as_array().unwrap().len(), 0);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bridge forwarding service tests — validate thin wrappers return correct errors
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod bridge_services {
+    use ecp_services::bridge_services::{AIService, AuthService, AgentService, SyntaxService, WorkflowService};
+    use ecp_services::Service;
+    use ecp_ai_bridge::AIBridge;
+    use std::sync::Arc;
+
+    /// Create a bridge that is NOT started — all requests should fail gracefully.
+    fn unstarted_bridge() -> Arc<AIBridge> {
+        Arc::new(AIBridge::new())
+    }
+
+    #[tokio::test]
+    async fn ai_service_forwards_namespace() {
+        let bridge = unstarted_bridge();
+        let svc = AIService::new(bridge);
+        assert_eq!(svc.namespace(), "ai");
+    }
+
+    #[tokio::test]
+    async fn auth_service_forwards_namespace() {
+        let bridge = unstarted_bridge();
+        let svc = AuthService::new(bridge);
+        assert_eq!(svc.namespace(), "auth");
+    }
+
+    #[tokio::test]
+    async fn agent_service_forwards_namespace() {
+        let bridge = unstarted_bridge();
+        let svc = AgentService::new(bridge);
+        assert_eq!(svc.namespace(), "agent");
+    }
+
+    #[tokio::test]
+    async fn workflow_service_forwards_namespace() {
+        let bridge = unstarted_bridge();
+        let svc = WorkflowService::new(bridge);
+        assert_eq!(svc.namespace(), "workflow");
+    }
+
+    #[tokio::test]
+    async fn syntax_service_forwards_namespace() {
+        let bridge = unstarted_bridge();
+        let svc = SyntaxService::new(bridge);
+        assert_eq!(svc.namespace(), "syntax");
+    }
+
+    #[tokio::test]
+    async fn unstarted_bridge_returns_error() {
+        let bridge = unstarted_bridge();
+        let svc = AIService::new(bridge);
+        let result = svc.handle("ai/models/list", None).await;
+        assert!(result.is_err(), "Should fail when bridge not started");
+        let err = result.unwrap_err();
+        assert_eq!(err.code, -32000);
+        assert!(err.message.contains("not started"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Models service tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod models {
+    use ecp_services::models::ModelsService;
+    use ecp_services::Service;
+
+    #[tokio::test]
+    async fn namespace_is_models() {
+        let svc = ModelsService::new(None);
+        assert_eq!(svc.namespace(), "models");
+    }
+
+    #[tokio::test]
+    async fn list_without_bridge_returns_fallback() {
+        let svc = ModelsService::new(None);
+        let result = svc.handle("models/list", None).await.unwrap();
+        // Should return either real file or fallback config
+        assert!(result.get("version").is_some() || result.get("models").is_some(),
+            "models/list should return a config object: {result}");
+    }
+
+    #[tokio::test]
+    async fn refresh_without_bridge_returns_error() {
+        let svc = ModelsService::new(None);
+        let result = svc.handle("models/refresh", None).await;
+        assert!(result.is_err(), "models/refresh should fail without bridge");
+    }
+
+    #[tokio::test]
+    async fn unknown_method_returns_error() {
+        let svc = ModelsService::new(None);
+        let result = svc.handle("models/nonexistent", None).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, -32601);
     }
 }

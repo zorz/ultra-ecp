@@ -380,19 +380,69 @@ impl Service for TerminalService {
                 let rows = p.rows.unwrap_or(24);
                 let id = format!("term-{}", uuid::Uuid::new_v4());
 
-                let (input_tx, _input_rx) = mpsc::channel::<Vec<u8>>(256);
+                let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(256);
                 let buffer = Arc::new(RwLock::new(String::new()));
 
-                let mut cmd_args = vec!["attach-session".to_string(), "-t".to_string(), p.session.clone()];
+                let mut cmd_args = Vec::new();
                 if let Some(ref socket) = p.socket {
-                    cmd_args.insert(0, format!("-S{}", socket));
+                    cmd_args.push(format!("-S{}", socket));
                 }
+                cmd_args.extend(["attach-session".to_string(), "-t".to_string(), p.session.clone()]);
 
+                let mut child = Command::new("tmux")
+                    .args(&cmd_args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| ECPError::server_error(format!("Failed to attach tmux: {e}")))?;
+
+                let child_stdin = child.stdin.take();
+                let child_stdout = child.stdout.take();
+
+                // Input forwarding
+                let input_id = id.clone();
+                tokio::spawn(async move {
+                    let mut stdin = match child_stdin {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    while let Some(data) = input_rx.recv().await {
+                        if stdin.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    debug!("Tmux input task ended for {input_id}");
+                });
+
+                // Output reading
+                let output_buffer = buffer.clone();
+                let output_id = id.clone();
+                tokio::spawn(async move {
+                    let mut stdout = match child_stdout {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        match stdout.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                                output_buffer.write().push_str(&text);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    debug!("Tmux output task ended for {output_id}");
+                });
+
+                let cwd = self.workspace_root.read().to_string_lossy().to_string();
                 let info = TerminalSessionInfo {
                     id: id.clone(),
                     name: format!("tmux:{}", p.session),
                     shell: "tmux".to_string(),
-                    cwd: self.workspace_root.read().to_string_lossy().to_string(),
+                    cwd,
                     cols,
                     rows,
                     running: true,

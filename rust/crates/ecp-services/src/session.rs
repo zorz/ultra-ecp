@@ -55,32 +55,47 @@ impl SessionService {
     }
 
     /// Load settings from the user config file.
+    /// Tries `.jsonc` first (JSONC with comments), then `.json`.
     async fn load_settings(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let settings_path = PathBuf::from(&home).join(".ultra/settings.json");
+        let ultra_dir = PathBuf::from(&home).join(".ultra");
 
-        if let Ok(content) = tokio::fs::read_to_string(&settings_path).await {
-            // Strip JSONC comments
-            let stripped = strip_jsonc_comments(&content);
-            if let Ok(parsed) = serde_json::from_str::<HashMap<String, Value>>(&stripped) {
-                let mut settings = self.settings.write();
-                for (key, value) in parsed {
-                    settings.insert(key, value);
+        // Try settings.jsonc first, then settings.json
+        let user_settings = [
+            ultra_dir.join("settings.jsonc"),
+            ultra_dir.join("settings.json"),
+        ];
+        for path in &user_settings {
+            if let Ok(content) = tokio::fs::read_to_string(path).await {
+                let stripped = strip_jsonc_comments(&content);
+                if let Ok(parsed) = serde_json::from_str::<HashMap<String, Value>>(&stripped) {
+                    let mut settings = self.settings.write();
+                    for (key, value) in parsed {
+                        settings.insert(key, value);
+                    }
+                    info!("Loaded settings from {}", path.display());
                 }
-                info!("Loaded settings from {}", settings_path.display());
+                break;
             }
         }
 
         // Also check workspace-local settings
-        let ws_settings = self.workspace_root.read().join(".ultra/settings.json");
-        if let Ok(content) = tokio::fs::read_to_string(&ws_settings).await {
-            let stripped = strip_jsonc_comments(&content);
-            if let Ok(parsed) = serde_json::from_str::<HashMap<String, Value>>(&stripped) {
-                let mut settings = self.settings.write();
-                for (key, value) in parsed {
-                    settings.insert(key, value);
+        let ws_root = self.workspace_root.read().clone();
+        let ws_settings = [
+            ws_root.join(".ultra/settings.jsonc"),
+            ws_root.join(".ultra/settings.json"),
+        ];
+        for path in &ws_settings {
+            if let Ok(content) = tokio::fs::read_to_string(path).await {
+                let stripped = strip_jsonc_comments(&content);
+                if let Ok(parsed) = serde_json::from_str::<HashMap<String, Value>>(&stripped) {
+                    let mut settings = self.settings.write();
+                    for (key, value) in parsed {
+                        settings.insert(key, value);
+                    }
+                    debug!("Loaded workspace settings from {}", path.display());
                 }
-                debug!("Loaded workspace settings from {}", ws_settings.display());
+                break;
             }
         }
 
@@ -270,7 +285,7 @@ impl Service for SessionService {
                     .get("workbench.colorTheme")
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "catppuccin-mocha".to_string());
-                let theme = find_theme(&theme_id);
+                let theme = load_theme(&theme_id).await;
                 Ok(json!({ "theme": theme }))
             }
 
@@ -284,12 +299,36 @@ impl Service for SessionService {
             }
 
             "theme/list" => {
-                Ok(json!({ "themes": [
-                    { "id": "catppuccin-mocha", "name": "Catppuccin Mocha", "type": "dark" },
-                    { "id": "catppuccin-macchiato", "name": "Catppuccin Macchiato", "type": "dark" },
-                    { "id": "catppuccin-frappe", "name": "Catppuccin Frappé", "type": "dark" },
-                    { "id": "catppuccin-latte", "name": "Catppuccin Latte", "type": "light" },
-                ]}))
+                let mut themes = Vec::new();
+                // Scan config/themes/ directory for theme files
+                let theme_dirs = ["config/themes", "../config/themes"];
+                let mut found_dir = false;
+                for dir in &theme_dirs {
+                    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+                        found_dir = true;
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.ends_with(".json") {
+                                let id = name.trim_end_matches(".json");
+                                let theme = load_theme(id).await;
+                                themes.push(theme);
+                            }
+                        }
+                        break;
+                    }
+                }
+                if !found_dir {
+                    // Fallback: return known theme metadata
+                    for (id, name, ttype) in [
+                        ("catppuccin-mocha", "Catppuccin Mocha", "dark"),
+                        ("catppuccin-macchiato", "Catppuccin Macchiato", "dark"),
+                        ("catppuccin-frappe", "Catppuccin Frappé", "dark"),
+                        ("catppuccin-latte", "Catppuccin Latte", "light"),
+                    ] {
+                        themes.push(json!({ "id": id, "name": name, "type": ttype }));
+                    }
+                }
+                Ok(json!({ "themes": themes }))
             }
 
             // ── Workspace methods ───────────────────────────────────────
@@ -490,19 +529,55 @@ fn default_settings() -> HashMap<String, Value> {
     s
 }
 
-fn find_theme(id: &str) -> Value {
-    let themes = [
-        ("catppuccin-mocha", "Catppuccin Mocha", "dark"),
-        ("catppuccin-macchiato", "Catppuccin Macchiato", "dark"),
-        ("catppuccin-frappe", "Catppuccin Frappé", "dark"),
-        ("catppuccin-latte", "Catppuccin Latte", "light"),
+/// Load a full theme from config/themes/{id}.json, falling back to catppuccin-mocha.
+async fn load_theme(id: &str) -> Value {
+    let filename = format!("{id}.json");
+
+    // Search paths: CWD/config/themes/, ../config/themes/ (for running from rust/ subdir)
+    let candidates = [
+        PathBuf::from("config/themes").join(&filename),
+        PathBuf::from("../config/themes").join(&filename),
     ];
-    for (tid, name, ttype) in &themes {
-        if *tid == id {
-            return json!({ "id": tid, "name": name, "type": ttype });
+
+    let try_read = |paths: &[PathBuf]| {
+        let paths = paths.to_vec();
+        async move {
+            for p in &paths {
+                if let Ok(content) = tokio::fs::read_to_string(p).await {
+                    return Some(content);
+                }
+            }
+            None
         }
+    };
+
+    let content = match try_read(&candidates).await {
+        Some(c) => c,
+        None if id != "catppuccin-mocha" => {
+            // Fall back to default theme
+            let fallback = [
+                PathBuf::from("config/themes/catppuccin-mocha.json"),
+                PathBuf::from("../config/themes/catppuccin-mocha.json"),
+            ];
+            match try_read(&fallback).await {
+                Some(c) => c,
+                None => return json!({ "id": id, "name": id, "type": "dark", "colors": {}, "tokenColors": [] }),
+            }
+        }
+        None => {
+            return json!({ "id": id, "name": id, "type": "dark", "colors": {}, "tokenColors": [] });
+        }
+    };
+
+    match serde_json::from_str::<Value>(&content) {
+        Ok(mut theme) => {
+            if let Some(obj) = theme.as_object_mut() {
+                obj.insert("id".to_string(), json!(id));
+            }
+            theme
+        }
+        Err(_) => json!({ "id": id, "name": id, "type": "dark", "colors": {}, "tokenColors": [] }),
     }
-    json!({ "id": id, "name": id, "type": "dark" })
 }
 
 fn config_schema() -> Value {
