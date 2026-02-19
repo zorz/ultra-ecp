@@ -1,0 +1,116 @@
+[package]
+name = "ultra-ecp"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ultra-ecp"
+path = "src/main.rs"
+
+[dependencies]
+ecp-protocol = { workspace = true }
+ecp-transport = { workspace = true }
+ecp-server = { workspace = true }
+ecp-services = { workspace = true }
+ecp-ai-bridge = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+hex = "0.4"
+
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "crates/ecp-protocol",
+    "crates/ecp-transport",
+    "crates/ecp-server",
+    "crates/ecp-services",
+    "crates/ecp-ai-bridge",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Ultra"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# WebSocket
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+
+# HTTP
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+hyper = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "6"
+parking_lot = "0.12"
+bytes = "1"
+
+# Process / PTY
+portable-pty = "0.8"
+
+# File watching
+notify = "7"
+
+# File search
+glob = "0.3"
+
+# Secrets
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Database
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+
+# Directories
+dirs = "6"
+
+# Internal crates
+ecp-protocol = { path = "crates/ecp-protocol" }
+ecp-transport = { path = "crates/ecp-transport" }
+ecp-server = { path = "crates/ecp-server" }
+ecp-services = { path = "crates/ecp-services" }
+ecp-ai-bridge = { path = "crates/ecp-ai-bridge" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ecp-protocol = { workspace = true }
+ecp-transport = { workspace = true }
+ecp-server = { workspace = true }
+ecp-services = { workspace = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,22 @@
+[package]
+name = "ecp-transport"
+description = "WebSocket and Unix socket transport for ECP"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ecp-protocol = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }

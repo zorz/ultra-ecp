@@ -826,10 +826,10 @@ export class AIServiceAdapter {
 
           if (agentEntry && p.storageSessionId) {
             // Returning agent — inject messages since last use
-            transcriptContext = this.buildTranscriptContext(p.storageSessionId, agentEntry.lastUsedAt);
+            transcriptContext = await this.buildTranscriptContext(p.storageSessionId, agentEntry.lastUsedAt);
           } else if (!agentEntry && p.storageSessionId) {
             // New agent — inject recent transcript for context
-            transcriptContext = this.buildTranscriptContext(p.storageSessionId);
+            transcriptContext = await this.buildTranscriptContext(p.storageSessionId);
           }
 
           // Get the chat session to determine fallback provider
@@ -982,14 +982,14 @@ export class AIServiceAdapter {
    * Build a condensed transcript of recent messages for agent context.
    * Uses ChatStorage to fetch stored messages.
    */
-  private buildTranscriptContext(
+  private async buildTranscriptContext(
     storageSessionId: string,
     sinceTimestamp?: number,
-  ): string | undefined {
+  ): Promise<string | undefined> {
     if (!this.chatStorage) return undefined;
 
     try {
-      const messages = this.chatStorage.getMessages(storageSessionId, {
+      const messages = await this.chatStorage.getMessages(storageSessionId, {
         ...(sinceTimestamp ? { after: sinceTimestamp } : {}),
         limit: 30,
       });
@@ -1722,7 +1722,7 @@ export class AIServiceAdapter {
     }
   }
 
-  private handleGetSessionAgents(params: unknown): HandlerResult {
+  private async handleGetSessionAgents(params: unknown): Promise<HandlerResult> {
     const p = params as { sessionId?: string };
     if (!p?.sessionId) {
       return {
@@ -1735,7 +1735,7 @@ export class AIServiceAdapter {
 
     // Read persisted session agents from database
     if (this.chatStorage) {
-      const storedAgents = this.chatStorage.getSessionAgents(p.sessionId);
+      const storedAgents = await this.chatStorage.getSessionAgents(p.sessionId);
       debugLog(`[AIServiceAdapter] getSessionAgents(${p.sessionId}): ${storedAgents.length} agents found`);
 
       // Enrich with current agent info from orchestrator/fallbacks
@@ -1861,7 +1861,7 @@ export class AIServiceAdapter {
     // Persist to database
     if (this.chatStorage) {
       try {
-        this.chatStorage.addSessionAgent(p.sessionId, resolvedAgent.id, resolvedAgent.role as AgentRole, resolvedAgent.name);
+        await this.chatStorage.addSessionAgent(p.sessionId, resolvedAgent.id, resolvedAgent.role as AgentRole, resolvedAgent.name);
         debugLog(`[AIServiceAdapter] Persisted session agent: ${resolvedAgent.id} → session ${p.sessionId}`);
       } catch (err) {
         console.error(`[AIServiceAdapter] Failed to persist session agent ${resolvedAgent.id} to session ${p.sessionId}:`, err);
@@ -1890,7 +1890,7 @@ export class AIServiceAdapter {
     };
   }
 
-  private handleRemoveSessionAgent(params: unknown): HandlerResult {
+  private async handleRemoveSessionAgent(params: unknown): Promise<HandlerResult> {
     const p = params as { sessionId?: string; agentId?: string };
     if (!p?.sessionId || !p?.agentId) {
       return {
@@ -1904,7 +1904,7 @@ export class AIServiceAdapter {
     // Persist removal to database
     if (this.chatStorage) {
       try {
-        this.chatStorage.removeSessionAgent(p.sessionId, p.agentId);
+        await this.chatStorage.removeSessionAgent(p.sessionId, p.agentId);
       } catch (err) {
         debugLog(`[AIServiceAdapter] Failed to persist agent removal: ${err}`);
       }
