@@ -533,6 +533,18 @@ mod document {
         assert!(err.is_err());
         assert_eq!(err.unwrap_err().code, -32601);
     }
+
+    #[tokio::test]
+    async fn responses_include_deprecation_notice() {
+        let s = svc();
+        let result = s.handle("document/open", Some(json!({
+            "uri": "file://test.txt", "content": "hello",
+        }))).await.unwrap();
+        assert!(result["_deprecated"].is_object());
+        assert!(result["_deprecated"]["message"].as_str().unwrap().contains("scheduled for removal"));
+        // Still functional — documentId returned
+        assert!(result["documentId"].is_string());
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -807,6 +819,24 @@ mod chat {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["toolName"], "file/read");
         assert_eq!(calls[0]["status"], "success");
+    }
+
+    #[tokio::test]
+    async fn tool_call_update_input() {
+        let (_tmp, s) = svc();
+        let sess = s.handle("chat/session/create", Some(json!({"title": "test"}))).await.unwrap();
+        let sid = sess["id"].as_str().unwrap();
+
+        let tc = s.handle("chat/toolCall/add", Some(json!({
+            "sessionId": sid, "toolName": "bash",
+            "input": {"command": "ls"},
+        }))).await.unwrap();
+        let tc_id = tc["toolCallId"].as_str().unwrap();
+
+        let result = s.handle("chat/toolCall/updateInput", Some(json!({
+            "id": tc_id, "input": {"command": "pwd"},
+        }))).await.unwrap();
+        assert_eq!(result["success"], true);
     }
 
     #[tokio::test]
@@ -1154,6 +1184,282 @@ mod chat {
         assert_eq!(todos[0]["content"], "new task 1");
         assert_eq!(todos[1]["content"], "new task 2");
         assert_eq!(todos[1]["status"], "in_progress");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Persona & Agent CRUD tests (via chat service)
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod persona_agent {
+    use super::*;
+    use ecp_services::chat::ChatService;
+    use ecp_services::Service;
+
+    fn svc() -> (TempDir, ChatService) {
+        let tmp = TempDir::new().unwrap();
+        let s = ChatService::new(tmp.path());
+        (tmp, s)
+    }
+
+    #[tokio::test]
+    async fn persona_crud() {
+        let (_tmp, s) = svc();
+
+        // Create
+        let result = s.handle("chat/persona/create", Some(json!({
+            "name": "Test Persona",
+            "description": "A test persona",
+            "problemSpace": "testing",
+            "pipelineStatus": "draft",
+        }))).await.unwrap();
+        let pid = result["id"].as_str().unwrap().to_string();
+        assert!(pid.starts_with("persona-"));
+        assert_eq!(result["name"], "Test Persona");
+        assert_eq!(result["description"], "A test persona");
+        assert_eq!(result["problemSpace"], "testing");
+        assert_eq!(result["pipelineStatus"], "draft");
+        assert_eq!(result["isSystem"], false);
+
+        // Get
+        let result = s.handle("chat/persona/get", Some(json!({ "id": &pid }))).await.unwrap();
+        assert_eq!(result["name"], "Test Persona");
+
+        // List
+        let result = s.handle("chat/persona/list", None).await.unwrap();
+        let personas = result["personas"].as_array().unwrap();
+        assert!(personas.iter().any(|p| p["id"].as_str() == Some(&pid)));
+
+        // List with status filter
+        let result = s.handle("chat/persona/list", Some(json!({ "status": "draft" }))).await.unwrap();
+        let personas = result["personas"].as_array().unwrap();
+        assert!(personas.iter().any(|p| p["id"].as_str() == Some(&pid)));
+
+        let result = s.handle("chat/persona/list", Some(json!({ "status": "published" }))).await.unwrap();
+        let personas = result["personas"].as_array().unwrap();
+        assert!(!personas.iter().any(|p| p["id"].as_str() == Some(&pid)));
+
+        // Update
+        let result = s.handle("chat/persona/update", Some(json!({
+            "id": &pid,
+            "name": "Updated Persona",
+            "pipelineStatus": "compressed",
+            "compressed": "You are a testing persona.",
+        }))).await.unwrap();
+        assert_eq!(result["name"], "Updated Persona");
+        assert_eq!(result["pipelineStatus"], "compressed");
+        assert_eq!(result["compressed"], "You are a testing persona.");
+
+        // Delete
+        let result = s.handle("chat/persona/delete", Some(json!({ "id": &pid }))).await.unwrap();
+        assert_eq!(result["success"], true);
+
+        // Verify deleted
+        let result = s.handle("chat/persona/get", Some(json!({ "id": &pid }))).await.unwrap();
+        assert!(result.is_null());
+    }
+
+    #[tokio::test]
+    async fn persona_system_protection() {
+        let (_tmp, s) = svc();
+
+        // Create system persona
+        let result = s.handle("chat/persona/create", Some(json!({
+            "name": "System Persona",
+            "isSystem": true,
+        }))).await.unwrap();
+        let pid = result["id"].as_str().unwrap().to_string();
+        assert_eq!(result["isSystem"], true);
+
+        // Try to delete — should fail
+        let result = s.handle("chat/persona/delete", Some(json!({ "id": &pid }))).await.unwrap();
+        assert_eq!(result["success"], false);
+
+        // Verify still exists
+        let result = s.handle("chat/persona/get", Some(json!({ "id": &pid }))).await.unwrap();
+        assert_eq!(result["name"], "System Persona");
+    }
+
+    #[tokio::test]
+    async fn agent_crud_via_chat() {
+        let (_tmp, s) = svc();
+
+        // Create
+        let result = s.handle("chat/agent/create", Some(json!({
+            "name": "Test Agent",
+            "description": "A test agent",
+            "role": "specialist",
+            "roleType": "general",
+            "systemPrompt": "You are a test agent.",
+            "tools": ["Read", "Write"],
+        }))).await.unwrap();
+        let aid = result["id"].as_str().unwrap().to_string();
+        assert!(aid.starts_with("agent-"));
+        assert_eq!(result["name"], "Test Agent");
+        assert_eq!(result["role"], "specialist");
+        assert_eq!(result["roleType"], "general");
+        assert_eq!(result["systemPrompt"], "You are a test agent.");
+        assert_eq!(result["isSystem"], false);
+        assert_eq!(result["isActive"], true);
+
+        // Get
+        let result = s.handle("chat/agent/get", Some(json!({ "id": &aid }))).await.unwrap();
+        assert_eq!(result["name"], "Test Agent");
+        assert_eq!(result["tools"], json!(["Read", "Write"]));
+
+        // Get by name
+        let result = s.handle("chat/agent/getByName", Some(json!({ "name": "Test Agent" }))).await.unwrap();
+        assert_eq!(result["id"], aid);
+
+        // List
+        let result = s.handle("chat/agent/list", None).await.unwrap();
+        let agents = result["agents"].as_array().unwrap();
+        assert!(agents.iter().any(|a| a["id"].as_str() == Some(&aid)));
+
+        // Update
+        let result = s.handle("chat/agent/update", Some(json!({
+            "id": &aid,
+            "name": "Updated Agent",
+            "agency": "autonomous",
+        }))).await.unwrap();
+        assert_eq!(result["name"], "Updated Agent");
+        assert_eq!(result["agency"], "autonomous");
+
+        // Delete
+        let result = s.handle("chat/agent/delete", Some(json!({ "id": &aid }))).await.unwrap();
+        assert_eq!(result["success"], true);
+
+        // Verify deleted
+        let result = s.handle("chat/agent/get", Some(json!({ "id": &aid }))).await.unwrap();
+        assert!(result.is_null());
+    }
+
+    #[tokio::test]
+    async fn agent_persona_link() {
+        let (_tmp, s) = svc();
+
+        // Create persona first
+        let persona = s.handle("chat/persona/create", Some(json!({
+            "name": "Linked Persona",
+            "compressed": "You embody careful testing.",
+        }))).await.unwrap();
+        let pid = persona["id"].as_str().unwrap().to_string();
+
+        // Create agent with personaId
+        let agent = s.handle("chat/agent/create", Some(json!({
+            "name": "Linked Agent",
+            "personaId": &pid,
+            "agency": "supervised",
+        }))).await.unwrap();
+        let aid = agent["id"].as_str().unwrap().to_string();
+        assert_eq!(agent["personaId"], pid);
+        assert_eq!(agent["agency"], "supervised");
+
+        // Verify via get
+        let result = s.handle("chat/agent/get", Some(json!({ "id": &aid }))).await.unwrap();
+        assert_eq!(result["personaId"], pid);
+    }
+
+    #[tokio::test]
+    async fn agent_system_protection() {
+        let (_tmp, s) = svc();
+
+        // System agents are seeded by ChatDb — "assistant" is always there
+        let result = s.handle("chat/agent/get", Some(json!({ "id": "assistant" }))).await.unwrap();
+        assert_eq!(result["isSystem"], true);
+
+        // Can't delete system agents
+        let result = s.handle("chat/agent/delete", Some(json!({ "id": "assistant" }))).await.unwrap();
+        assert_eq!(result["success"], false);
+
+        // Can't update system agents
+        let result = s.handle("chat/agent/update", Some(json!({
+            "id": "assistant",
+            "name": "Hacked!",
+        }))).await.unwrap();
+        // Should return null (not found/not modifiable)
+        assert!(result.is_null());
+    }
+
+    #[tokio::test]
+    async fn agent_with_custom_id() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("chat/agent/create", Some(json!({
+            "id": "my-custom-agent",
+            "name": "Custom ID Agent",
+        }))).await.unwrap();
+        assert_eq!(result["id"], "my-custom-agent");
+
+        let result = s.handle("chat/agent/get", Some(json!({ "id": "my-custom-agent" }))).await.unwrap();
+        assert_eq!(result["name"], "Custom ID Agent");
+    }
+
+    #[tokio::test]
+    async fn persona_with_custom_id() {
+        let (_tmp, s) = svc();
+
+        let result = s.handle("chat/persona/create", Some(json!({
+            "id": "my-custom-persona",
+            "name": "Custom ID Persona",
+        }))).await.unwrap();
+        assert_eq!(result["id"], "my-custom-persona");
+
+        let result = s.handle("chat/persona/get", Some(json!({ "id": "my-custom-persona" }))).await.unwrap();
+        assert_eq!(result["name"], "Custom ID Persona");
+    }
+
+    #[tokio::test]
+    async fn persona_full_pipeline() {
+        let (_tmp, s) = svc();
+
+        // Create with all fields
+        let result = s.handle("chat/persona/create", Some(json!({
+            "name": "Full Persona",
+            "description": "Complete persona",
+            "problemSpace": "Software architecture",
+            "highLevel": "Thinks in systems and boundaries",
+            "archetype": "The Architect",
+            "principles": "Separation of concerns, least privilege",
+            "taste": "Prefers explicit over implicit",
+            "compressed": "You are a systems architect...",
+            "pipelineStatus": "published",
+            "avatar": "architect.png",
+            "color": "#3498db",
+        }))).await.unwrap();
+
+        assert_eq!(result["name"], "Full Persona");
+        assert_eq!(result["highLevel"], "Thinks in systems and boundaries");
+        assert_eq!(result["archetype"], "The Architect");
+        assert_eq!(result["pipelineStatus"], "published");
+        assert_eq!(result["avatar"], "architect.png");
+        assert_eq!(result["color"], "#3498db");
+    }
+
+    #[tokio::test]
+    async fn agent_list_with_filters() {
+        let (_tmp, s) = svc();
+
+        // Create a non-system agent
+        s.handle("chat/agent/create", Some(json!({
+            "name": "Filter Test Agent",
+            "roleType": "specialist",
+        }))).await.unwrap();
+
+        // List with includeSystem=false — should exclude seeded agents
+        let result = s.handle("chat/agent/list", Some(json!({
+            "includeSystem": false,
+        }))).await.unwrap();
+        let agents = result["agents"].as_array().unwrap();
+        assert!(agents.iter().all(|a| a["isSystem"] == false));
+        assert!(agents.iter().any(|a| a["name"] == "Filter Test Agent"));
+
+        // List with includeSystem=true — should include seeded agents
+        let result = s.handle("chat/agent/list", Some(json!({
+            "includeSystem": true,
+        }))).await.unwrap();
+        let agents = result["agents"].as_array().unwrap();
+        assert!(agents.iter().any(|a| a["isSystem"] == true));
     }
 }
 
@@ -1816,6 +2122,23 @@ mod database {
         let s = DatabaseService::new(tmp.path().to_path_buf());
 
         let err = s.handle("database/connect", Some(json!({"connectionId": "nonexistent"}))).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_stub_returns_not_cancelled() {
+        let tmp = TempDir::new().unwrap();
+        let s = DatabaseService::new(tmp.path().to_path_buf());
+        let result = s.handle("database/cancel", Some(json!({"queryId": "q-123"}))).await.unwrap();
+        assert_eq!(result["cancelled"], false);
+        assert!(result["reason"].as_str().unwrap().contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn fetch_rows_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let s = DatabaseService::new(tmp.path().to_path_buf());
+        let err = s.handle("database/fetchRows", Some(json!({"queryId": "q-123", "offset": 0, "limit": 10}))).await;
         assert!(err.is_err());
     }
 }

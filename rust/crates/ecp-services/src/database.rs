@@ -714,6 +714,24 @@ impl Service for DatabaseService {
                 Ok(json!({ "favorites": *favorites }))
             }
 
+            "database/cancel" => {
+                // tokio-postgres doesn't expose per-query cancellation tokens.
+                // The TS implementation uses AbortController on postgres.js.
+                // Return success: false with an explanation.
+                let _p: CancelParams = parse_params(params)?;
+                Ok(json!({
+                    "cancelled": false,
+                    "reason": "Query cancellation not supported in Rust build. Kill the connection with database/disconnect instead."
+                }))
+            }
+
+            "database/fetchRows" => {
+                // TS throws "not yet implemented" too. This is a pagination concept that
+                // requires caching query results or re-running with OFFSET/LIMIT.
+                let _p: FetchRowsParams = parse_params(params)?;
+                Err(ECPError::server_error("fetchRows not yet implemented — use database/query with SQL LIMIT/OFFSET instead"))
+            }
+
             _ => Err(ECPError::method_not_found(method)),
         }
     }
@@ -844,6 +862,24 @@ struct FavoriteParams {
     sql: String,
     #[serde(rename = "connectionId")]
     connection_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CancelParams {
+    #[serde(rename = "queryId")]
+    #[allow(dead_code)]
+    query_id: String,
+}
+
+#[derive(Deserialize)]
+struct FetchRowsParams {
+    #[serde(rename = "queryId")]
+    #[allow(dead_code)]
+    query_id: String,
+    #[allow(dead_code)]
+    offset: i64,
+    #[allow(dead_code)]
+    limit: i64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

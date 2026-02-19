@@ -358,6 +358,23 @@ impl Service for DocumentService {
     }
 
     async fn handle(&self, method: &str, params: Option<serde_json::Value>) -> HandlerResult {
+        let result = self.handle_inner(method, params).await?;
+
+        // Inject deprecation notice into all successful responses
+        if let Value::Object(mut map) = result {
+            map.insert("_deprecated".into(), json!({
+                "message": "The document service is scheduled for removal. Use file/read and file/write instead.",
+                "alternative": "file/*"
+            }));
+            Ok(Value::Object(map))
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+impl DocumentService {
+    async fn handle_inner(&self, method: &str, params: Option<serde_json::Value>) -> HandlerResult {
         match method {
             "document/open" => {
                 let p: DocOpenParams = parse_params(params)?;

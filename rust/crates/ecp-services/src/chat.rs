@@ -23,6 +23,32 @@ const UNIFIED_SCHEMA: &str = r#"
 -- Agent Registry
 -- ============================================================================
 
+-- ============================================================================
+-- Personas
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS personas (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    problem_space TEXT,
+    high_level TEXT,
+    archetype TEXT,
+    principles TEXT,
+    taste TEXT,
+    compressed TEXT,
+    pipeline_status TEXT NOT NULL DEFAULT 'draft'
+        CHECK(pipeline_status IN ('draft','sketched','archetyped','principled','flavored','compressed','published')),
+    avatar TEXT,
+    color TEXT,
+    is_system INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+    updated_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_personas_name ON personas(name);
+CREATE INDEX IF NOT EXISTS idx_personas_status ON personas(pipeline_status);
+
 CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -33,6 +59,11 @@ CREATE TABLE IF NOT EXISTS agents (
     system_prompt TEXT,
     tools TEXT,
     persona TEXT,
+    persona_id TEXT REFERENCES personas(id) ON DELETE SET NULL,
+    agency TEXT,
+    role_type TEXT NOT NULL DEFAULT 'general',
+    scope TEXT NOT NULL DEFAULT 'global',
+    config JSON NOT NULL DEFAULT '{}',
     is_system INTEGER DEFAULT 0,
     is_active INTEGER DEFAULT 1,
     created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
@@ -42,6 +73,9 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE INDEX IF NOT EXISTS idx_agents_name ON agents(name);
 CREATE INDEX IF NOT EXISTS idx_agents_role ON agents(role);
 CREATE INDEX IF NOT EXISTS idx_agents_active ON agents(is_active);
+CREATE INDEX IF NOT EXISTS idx_agents_role_type ON agents(role_type);
+CREATE INDEX IF NOT EXISTS idx_agents_scope ON agents(scope);
+CREATE INDEX IF NOT EXISTS idx_agents_updated ON agents(updated_at DESC);
 
 -- ============================================================================
 -- Workflows
@@ -453,6 +487,97 @@ CREATE TABLE IF NOT EXISTS activity (
 CREATE INDEX IF NOT EXISTS idx_activity_session ON activity(session_id, created_at);
 
 -- ============================================================================
+-- Agent Memory
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_memory (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    memory_type TEXT NOT NULL CHECK(memory_type IN ('fact', 'instruction', 'context', 'conversation', 'task')),
+    content TEXT NOT NULL,
+    metadata JSON,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_memory_agent ON agent_memory(agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_type ON agent_memory(agent_id, memory_type);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_expires ON agent_memory(expires_at);
+
+-- ============================================================================
+-- Agent Messages
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_messages (
+    id TEXT PRIMARY KEY,
+    from_agent_id TEXT NOT NULL,
+    to_agent_id TEXT NOT NULL,
+    message_type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    data JSON,
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    acknowledged_at INTEGER,
+    FOREIGN KEY (from_agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    FOREIGN KEY (to_agent_id) REFERENCES agents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_messages_to ON agent_messages(to_agent_id, acknowledged);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_from ON agent_messages(from_agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_messages_created ON agent_messages(created_at DESC);
+
+-- ============================================================================
+-- Agent Metrics
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_metrics (
+    agent_id TEXT PRIMARY KEY,
+    run_count INTEGER NOT NULL DEFAULT 0,
+    tasks_completed INTEGER NOT NULL DEFAULT 0,
+    tasks_failed INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    avg_response_time_ms REAL NOT NULL DEFAULT 0,
+    last_run_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+);
+
+-- ============================================================================
+-- Agent Shared Memory
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_shared_memory (
+    context_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value JSON NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    written_by TEXT NOT NULL,
+    written_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    PRIMARY KEY (context_id, key),
+    FOREIGN KEY (written_by) REFERENCES agents(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_shared_memory_context ON agent_shared_memory(context_id);
+CREATE INDEX IF NOT EXISTS idx_agent_shared_memory_expires ON agent_shared_memory(expires_at);
+
+-- ============================================================================
+-- Agent State
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS agent_state (
+    agent_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'idle' CHECK(status IN ('idle', 'thinking', 'executing', 'waiting', 'error', 'completed')),
+    current_action TEXT,
+    context_json TEXT,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_state_status ON agent_state(status);
+
+-- ============================================================================
 -- Schema version tracking
 -- ============================================================================
 
@@ -569,6 +694,12 @@ impl ChatDb {
         self.ensure_column("todos", "assigned_agent_id", "TEXT");
 
         self.ensure_column("permissions", "workflow_id", "TEXT");
+
+        self.ensure_column("agents", "persona_id", "TEXT REFERENCES personas(id) ON DELETE SET NULL");
+        self.ensure_column("agents", "agency", "TEXT");
+        self.ensure_column("agents", "role_type", "TEXT NOT NULL DEFAULT 'general'");
+        self.ensure_column("agents", "scope", "TEXT NOT NULL DEFAULT 'global'");
+        self.ensure_column("agents", "config", "JSON NOT NULL DEFAULT '{}'");
 
         self.ensure_column("documents", "agent_id", "TEXT");
         self.ensure_column("documents", "summary", "TEXT");
@@ -880,6 +1011,14 @@ impl ChatDb {
             rusqlite::params![id, session_id, message_id, tool_name, input, agent_id, agent_name, node_execution_id, now],
         )?;
         Ok(())
+    }
+
+    fn update_tool_call_input(&self, id: &str, input: &str) -> Result<bool, rusqlite::Error> {
+        let updated = self.conn.execute(
+            "UPDATE tool_calls SET input = ?1 WHERE id = ?2",
+            rusqlite::params![input, id],
+        )?;
+        Ok(updated > 0)
     }
 
     fn complete_tool_call(&self, id: &str, output: Option<&str>, status: &str, error_message: Option<&str>) -> Result<bool, rusqlite::Error> {
@@ -1648,6 +1787,286 @@ impl ChatDb {
         )?;
         Ok(changed > 0)
     }
+
+    // ── Persona CRUD ────────────────────────────────────────────────────
+
+    fn create_persona(
+        &self, id: &str, name: &str, description: Option<&str>,
+        problem_space: Option<&str>, high_level: Option<&str>,
+        archetype: Option<&str>, principles: Option<&str>,
+        taste: Option<&str>, compressed: Option<&str>,
+        pipeline_status: Option<&str>, avatar: Option<&str>,
+        color: Option<&str>, is_system: bool,
+    ) -> Result<Value, rusqlite::Error> {
+        let now = now_ms() as i64;
+        let status = pipeline_status.unwrap_or("draft");
+        let sys = if is_system { 1i32 } else { 0i32 };
+        self.conn.execute(
+            "INSERT INTO personas (id, name, description, problem_space, high_level, archetype, principles, taste, compressed, pipeline_status, avatar, color, is_system, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+            rusqlite::params![id, name, description, problem_space, high_level, archetype, principles, taste, compressed, status, avatar, color, sys, now],
+        )?;
+        Ok(self.get_persona(id)?.unwrap_or(Value::Null))
+    }
+
+    fn get_persona(&self, id: &str) -> Result<Option<Value>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, problem_space, high_level, archetype, principles, taste,
+                    compressed, pipeline_status, avatar, color, is_system, created_at, updated_at
+             FROM personas WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query(rusqlite::params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(persona_row_to_json(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn list_personas(&self, status: Option<&str>, include_system: bool, limit: i64, offset: i64) -> Result<Vec<Value>, rusqlite::Error> {
+        let mut sql = "SELECT id, name, description, problem_space, high_level, archetype, principles, taste,
+                    compressed, pipeline_status, avatar, color, is_system, created_at, updated_at
+             FROM personas WHERE 1=1".to_string();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(s) = status {
+            sql += " AND pipeline_status = ?";
+            params.push(Box::new(s.to_string()));
+        }
+        if !include_system {
+            sql += " AND is_system = 0";
+        }
+        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| persona_row_to_json(row))?;
+        rows.collect()
+    }
+
+    fn update_persona(
+        &self, id: &str, name: Option<&str>, description: Option<&str>,
+        problem_space: Option<&str>, high_level: Option<&str>,
+        archetype: Option<&str>, principles: Option<&str>,
+        taste: Option<&str>, compressed: Option<&str>,
+        pipeline_status: Option<&str>, avatar: Option<&str>,
+        color: Option<&str>,
+    ) -> Result<Option<Value>, rusqlite::Error> {
+        if self.get_persona(id)?.is_none() {
+            return Ok(None);
+        }
+
+        let now = now_ms() as i64;
+        let mut sets = vec!["updated_at = ?1".to_string()];
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now)];
+        let mut idx = 2u32;
+
+        macro_rules! add_set {
+            ($field:expr, $col:expr) => {
+                if let Some(v) = $field {
+                    sets.push(format!("{} = ?{}", $col, idx));
+                    params_vec.push(Box::new(v.to_string()));
+                    idx += 1;
+                }
+            };
+        }
+
+        add_set!(name, "name");
+        add_set!(description, "description");
+        add_set!(problem_space, "problem_space");
+        add_set!(high_level, "high_level");
+        add_set!(archetype, "archetype");
+        add_set!(principles, "principles");
+        add_set!(taste, "taste");
+        add_set!(compressed, "compressed");
+        add_set!(pipeline_status, "pipeline_status");
+        add_set!(avatar, "avatar");
+        add_set!(color, "color");
+
+        let sql = format!("UPDATE personas SET {} WHERE id = ?{}", sets.join(", "), idx);
+        params_vec.push(Box::new(id.to_string()));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        self.conn.execute(&sql, params_refs.as_slice())?;
+
+        self.get_persona(id)
+    }
+
+    fn delete_persona(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        // Don't delete system personas
+        let is_system: i32 = self.conn.query_row(
+            "SELECT COALESCE(is_system, 0) FROM personas WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        if is_system == 1 {
+            return Ok(false);
+        }
+        let changed = self.conn.execute("DELETE FROM personas WHERE id = ?1", rusqlite::params![id])?;
+        Ok(changed > 0)
+    }
+
+    // ── Chat Agent CRUD ─────────────────────────────────────────────────
+
+    fn create_chat_agent(
+        &self, id: &str, name: &str, description: Option<&str>,
+        role: Option<&str>, provider: Option<&str>, model: Option<&str>,
+        system_prompt: Option<&str>, tools: Option<&str>, persona_text: Option<&str>,
+        persona_id: Option<&str>, agency: Option<&str>,
+        role_type: Option<&str>, scope: Option<&str>, config: Option<&str>,
+        is_system: bool,
+    ) -> Result<Value, rusqlite::Error> {
+        let now = now_ms() as i64;
+        let role_val = role.unwrap_or("primary");
+        let provider_val = provider.unwrap_or("claude");
+        let model_val = model.unwrap_or("claude-sonnet-4-20250514");
+        let role_type_val = role_type.unwrap_or("general");
+        let scope_val = scope.unwrap_or("global");
+        let config_val = config.unwrap_or("{}");
+        let sys = if is_system { 1i32 } else { 0i32 };
+        self.conn.execute(
+            "INSERT INTO agents (id, name, description, role, provider, model, system_prompt, tools, persona, persona_id, agency, role_type, scope, config, is_system, is_active, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1, ?16, ?16)",
+            rusqlite::params![id, name, description, role_val, provider_val, model_val, system_prompt, tools, persona_text, persona_id, agency, role_type_val, scope_val, config_val, sys, now],
+        )?;
+        Ok(self.get_chat_agent(id)?.unwrap_or(Value::Null))
+    }
+
+    fn get_chat_agent(&self, id: &str) -> Result<Option<Value>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, role, provider, model, system_prompt, tools, persona,
+                    persona_id, agency, role_type, scope, config, is_system, is_active, created_at, updated_at
+             FROM agents WHERE id = ?1"
+        )?;
+        let mut rows = stmt.query(rusqlite::params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(chat_agent_row_to_json(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_chat_agent_by_name(&self, name: &str) -> Result<Option<Value>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, role, provider, model, system_prompt, tools, persona,
+                    persona_id, agency, role_type, scope, config, is_system, is_active, created_at, updated_at
+             FROM agents WHERE name = ?1 LIMIT 1"
+        )?;
+        let mut rows = stmt.query(rusqlite::params![name])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(chat_agent_row_to_json(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn list_chat_agents(
+        &self, role_type: Option<&str>, include_system: bool,
+        active_only: bool, limit: i64, offset: i64,
+    ) -> Result<Vec<Value>, rusqlite::Error> {
+        let mut sql = "SELECT id, name, description, role, provider, model, system_prompt, tools, persona,
+                    persona_id, agency, role_type, scope, config, is_system, is_active, created_at, updated_at
+             FROM agents WHERE 1=1".to_string();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(rt) = role_type {
+            sql += " AND role_type = ?";
+            params.push(Box::new(rt.to_string()));
+        }
+        if !include_system {
+            sql += " AND is_system = 0";
+        }
+        if active_only {
+            sql += " AND is_active = 1";
+        }
+        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| chat_agent_row_to_json(row))?;
+        rows.collect()
+    }
+
+    fn update_chat_agent(
+        &self, id: &str, name: Option<&str>, description: Option<&str>,
+        role: Option<&str>, provider: Option<&str>, model: Option<&str>,
+        system_prompt: Option<&str>, tools: Option<&str>, persona_text: Option<&str>,
+        persona_id: Option<&str>, agency: Option<&str>,
+        role_type: Option<&str>, scope: Option<&str>, config: Option<&str>,
+        is_active: Option<bool>,
+    ) -> Result<Option<Value>, rusqlite::Error> {
+        // Check existence and system protection
+        let existing = self.get_chat_agent(id)?;
+        match &existing {
+            None => return Ok(None),
+            Some(e) => {
+                if e.get("isSystem").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    return Ok(None); // Can't modify system agents
+                }
+            }
+        }
+
+        let now = now_ms() as i64;
+        let mut sets = vec!["updated_at = ?1".to_string()];
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now)];
+        let mut idx = 2u32;
+
+        macro_rules! add_set {
+            ($field:expr, $col:expr) => {
+                if let Some(v) = $field {
+                    sets.push(format!("{} = ?{}", $col, idx));
+                    params_vec.push(Box::new(v.to_string()));
+                    idx += 1;
+                }
+            };
+        }
+
+        add_set!(name, "name");
+        add_set!(description, "description");
+        add_set!(role, "role");
+        add_set!(provider, "provider");
+        add_set!(model, "model");
+        add_set!(system_prompt, "system_prompt");
+        add_set!(tools, "tools");
+        add_set!(persona_text, "persona");
+        add_set!(persona_id, "persona_id");
+        add_set!(agency, "agency");
+        add_set!(role_type, "role_type");
+        add_set!(scope, "scope");
+        add_set!(config, "config");
+
+        if let Some(active) = is_active {
+            sets.push(format!("is_active = ?{}", idx));
+            params_vec.push(Box::new(if active { 1i32 } else { 0i32 }));
+            idx += 1;
+        }
+
+        let sql = format!("UPDATE agents SET {} WHERE id = ?{}", sets.join(", "), idx);
+        params_vec.push(Box::new(id.to_string()));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        self.conn.execute(&sql, params_refs.as_slice())?;
+
+        self.get_chat_agent(id)
+    }
+
+    fn delete_chat_agent(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        // Don't delete system agents
+        let is_system: i32 = self.conn.query_row(
+            "SELECT COALESCE(is_system, 0) FROM agents WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        if is_system == 1 {
+            return Ok(false);
+        }
+        let changed = self.conn.execute("DELETE FROM agents WHERE id = ?1", rusqlite::params![id])?;
+        Ok(changed > 0)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1763,6 +2182,64 @@ fn compaction_row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 
 
 
+fn persona_row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "id": row.get::<_, String>(0)?,
+        "name": row.get::<_, String>(1)?,
+        "description": row.get::<_, Option<String>>(2)?,
+        "problemSpace": row.get::<_, Option<String>>(3)?,
+        "highLevel": row.get::<_, Option<String>>(4)?,
+        "archetype": row.get::<_, Option<String>>(5)?,
+        "principles": row.get::<_, Option<String>>(6)?,
+        "taste": row.get::<_, Option<String>>(7)?,
+        "compressed": row.get::<_, Option<String>>(8)?,
+        "pipelineStatus": row.get::<_, String>(9)?,
+        "avatar": row.get::<_, Option<String>>(10)?,
+        "color": row.get::<_, Option<String>>(11)?,
+        "isSystem": row.get::<_, Option<i64>>(12)?.unwrap_or(0) == 1,
+        "createdAt": row.get::<_, i64>(13)?,
+        "updatedAt": row.get::<_, Option<i64>>(14)?,
+    }))
+}
+
+fn chat_agent_row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let tools_str = row.get::<_, Option<String>>(7)?;
+    let tools: Value = tools_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    let persona_str = row.get::<_, Option<String>>(8)?;
+    let persona: Value = persona_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    let config_str = row.get::<_, Option<String>>(13)?;
+    let config: Value = config_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(json!({}));
+    Ok(json!({
+        "id": row.get::<_, String>(0)?,
+        "name": row.get::<_, String>(1)?,
+        "description": row.get::<_, Option<String>>(2)?,
+        "role": row.get::<_, Option<String>>(3)?,
+        "provider": row.get::<_, String>(4)?,
+        "model": row.get::<_, String>(5)?,
+        "systemPrompt": row.get::<_, Option<String>>(6)?,
+        "tools": tools,
+        "persona": persona,
+        "personaId": row.get::<_, Option<String>>(9)?,
+        "agency": row.get::<_, Option<String>>(10)?,
+        "roleType": row.get::<_, String>(11)?,
+        "scope": row.get::<_, String>(12)?,
+        "config": config,
+        "isSystem": row.get::<_, Option<i64>>(14)?.unwrap_or(0) == 1,
+        "isActive": row.get::<_, Option<i64>>(15)?.unwrap_or(1) == 1,
+        "createdAt": row.get::<_, i64>(16)?,
+        "updatedAt": row.get::<_, Option<i64>>(17)?,
+    }))
+}
+
 fn permission_row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     Ok(json!({
         "id": row.get::<_, String>(0)?,
@@ -1782,19 +2259,26 @@ fn permission_row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct ChatService {
-    db: Arc<Mutex<ChatDb>>,
+    db: Arc<Mutex<ChatDb>>,         // project: workspace/.ultra/chat.db
+    global_db: Arc<Mutex<ChatDb>>,  // global:  ~/.ultra/chat.db
 }
 
 impl ChatService {
     pub fn new(workspace_root: &std::path::Path) -> Self {
         let db_path = workspace_root.join(".ultra/chat.db");
-        let db = ChatDb::open(&db_path).expect("Failed to open chat database");
+        let db = ChatDb::open(&db_path).expect("Failed to open project chat database");
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let global_path = std::path::PathBuf::from(&home).join(".ultra/chat.db");
+        let global_db = ChatDb::open(&global_path).expect("Failed to open global chat database");
+
         Self {
             db: Arc::new(Mutex::new(db)),
+            global_db: Arc::new(Mutex::new(global_db)),
         }
     }
 
-    /// Run a blocking DB operation on the tokio blocking pool.
+    /// Run a blocking DB operation on the tokio blocking pool (project DB).
     async fn with_db<F, R>(&self, f: F) -> Result<R, ECPError>
     where
         F: FnOnce(&ChatDb) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -1808,6 +2292,50 @@ impl ChatService {
         .await
         .map_err(|e| ECPError::server_error(format!("Task join error: {e}")))?
         .map_err(|e| ECPError::server_error(format!("Database error: {e}")))
+    }
+
+    /// Run a blocking DB operation on the global DB.
+    async fn with_global_db<F, R>(&self, f: F) -> Result<R, ECPError>
+    where
+        F: FnOnce(&ChatDb) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        let db = self.global_db.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = db.lock();
+            f(&db)
+        })
+        .await
+        .map_err(|e| ECPError::server_error(format!("Task join error: {e}")))?
+        .map_err(|e| ECPError::server_error(format!("Database error: {e}")))
+    }
+
+    /// Run on both project and global DBs, merge results.
+    async fn with_both_dbs<F, R>(&self, f: F) -> Result<(R, R), ECPError>
+    where
+        F: Fn(&ChatDb) -> Result<R, rusqlite::Error> + Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        let project_db = self.db.clone();
+        let global_db = self.global_db.clone();
+        let f = Arc::new(f);
+        let f2 = f.clone();
+
+        let (project_result, global_result) = tokio::try_join!(
+            tokio::task::spawn_blocking(move || {
+                let db = project_db.lock();
+                f(&db)
+            }),
+            tokio::task::spawn_blocking(move || {
+                let db = global_db.lock();
+                f2(&db)
+            }),
+        )
+        .map_err(|e| ECPError::server_error(format!("Task join error: {e}")))?;
+
+        let project = project_result.map_err(|e| ECPError::server_error(format!("Database error: {e}")))?;
+        let global = global_result.map_err(|e| ECPError::server_error(format!("Database error: {e}")))?;
+        Ok((project, global))
     }
 }
 
@@ -1959,6 +2487,14 @@ impl Service for ChatService {
                 let limit = p.limit.unwrap_or(100);
                 let calls = self.with_db(move |db| db.list_tool_calls(&p.session_id, limit)).await?;
                 Ok(Value::Array(calls))
+            }
+
+            "chat/toolCall/updateInput" => {
+                let p: ToolCallUpdateInputParams = parse_params(params)?;
+                let input_str = serde_json::to_string(&p.input.unwrap_or(json!({}))).unwrap_or_else(|_| "{}".into());
+                let id = p.id;
+                let updated = self.with_db(move |db| db.update_tool_call_input(&id, &input_str)).await?;
+                Ok(json!({ "success": updated }))
             }
 
             // ── Permissions ──────────────────────────────────────────
@@ -2288,6 +2824,271 @@ impl Service for ChatService {
                 Ok(Value::Array(todos))
             }
 
+            // ── Personas (dual-DB) ───────────────────────────────────
+            "chat/persona/create" => {
+                let p: PersonaCreateParams = parse_params(params)?;
+                let id = p.id.unwrap_or_else(|| format!("persona-{}", uuid_v4()));
+                let is_global = p.scope.as_deref() == Some("global");
+                let is_system = p.is_system.unwrap_or(false);
+
+                if is_global {
+                    let persona = self.with_global_db(move |db| {
+                        db.create_persona(
+                            &id, &p.name, p.description.as_deref(),
+                            p.problem_space.as_deref(), p.high_level.as_deref(),
+                            p.archetype.as_deref(), p.principles.as_deref(),
+                            p.taste.as_deref(), p.compressed.as_deref(),
+                            p.pipeline_status.as_deref(), p.avatar.as_deref(),
+                            p.color.as_deref(), is_system,
+                        )
+                    }).await?;
+                    Ok(persona)
+                } else {
+                    let persona = self.with_db(move |db| {
+                        db.create_persona(
+                            &id, &p.name, p.description.as_deref(),
+                            p.problem_space.as_deref(), p.high_level.as_deref(),
+                            p.archetype.as_deref(), p.principles.as_deref(),
+                            p.taste.as_deref(), p.compressed.as_deref(),
+                            p.pipeline_status.as_deref(), p.avatar.as_deref(),
+                            p.color.as_deref(), is_system,
+                        )
+                    }).await?;
+                    Ok(persona)
+                }
+            }
+
+            "chat/persona/get" => {
+                let p: IdParam = parse_params(params)?;
+                let id = p.id.clone();
+                // Project first, fall back to global
+                let persona = self.with_db(move |db| db.get_persona(&p.id)).await?;
+                if persona.is_some() {
+                    return Ok(persona.unwrap());
+                }
+                let persona = self.with_global_db(move |db| db.get_persona(&id)).await?;
+                Ok(persona.unwrap_or(Value::Null))
+            }
+
+            "chat/persona/list" => {
+                let p: PersonaListParams = parse_params_optional(params);
+                let status = p.status.clone();
+                let include_system = p.include_system.unwrap_or(true);
+                let limit = p.limit.unwrap_or(100);
+                let offset = p.offset.unwrap_or(0);
+
+                let status2 = status.clone();
+                let (project, global) = self.with_both_dbs(move |db| {
+                    db.list_personas(status2.as_deref(), include_system, limit, offset)
+                }).await?;
+
+                // Merge: project personas first, then global ones not already present
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut merged = Vec::new();
+                for p in project {
+                    if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
+                        seen.insert(id.to_string());
+                    }
+                    merged.push(p);
+                }
+                for p in global {
+                    if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
+                        if !seen.contains(id) {
+                            merged.push(p);
+                        }
+                    }
+                }
+                Ok(json!({ "personas": merged }))
+            }
+
+            "chat/persona/update" => {
+                let p: PersonaUpdateParams = parse_params(params)?;
+                // Check project DB first
+                let in_project = self.with_db({
+                    let id = p.id.clone();
+                    move |db| db.get_persona(&id)
+                }).await?;
+
+                if in_project.is_some() {
+                    let result = self.with_db(move |db| {
+                        db.update_persona(
+                            &p.id, p.name.as_deref(), p.description.as_deref(),
+                            p.problem_space.as_deref(), p.high_level.as_deref(),
+                            p.archetype.as_deref(), p.principles.as_deref(),
+                            p.taste.as_deref(), p.compressed.as_deref(),
+                            p.pipeline_status.as_deref(), p.avatar.as_deref(),
+                            p.color.as_deref(),
+                        )
+                    }).await?;
+                    return Ok(result.unwrap_or(Value::Null));
+                }
+
+                // Fall back to global
+                let result = self.with_global_db(move |db| {
+                    db.update_persona(
+                        &p.id, p.name.as_deref(), p.description.as_deref(),
+                        p.problem_space.as_deref(), p.high_level.as_deref(),
+                        p.archetype.as_deref(), p.principles.as_deref(),
+                        p.taste.as_deref(), p.compressed.as_deref(),
+                        p.pipeline_status.as_deref(), p.avatar.as_deref(),
+                        p.color.as_deref(),
+                    )
+                }).await?;
+                Ok(result.unwrap_or(Value::Null))
+            }
+
+            "chat/persona/delete" => {
+                let p: IdParam = parse_params(params)?;
+                let id = p.id.clone();
+                // Try project first
+                let deleted = self.with_db(move |db| db.delete_persona(&p.id)).await?;
+                if deleted {
+                    return Ok(json!({ "success": true }));
+                }
+                // Try global
+                let deleted = self.with_global_db(move |db| db.delete_persona(&id)).await?;
+                Ok(json!({ "success": deleted }))
+            }
+
+            // ── Chat Agents (dual-DB) ───────────────────────────────────
+            "chat/agent/create" => {
+                let p: AgentCreateParams = parse_params(params)?;
+                let id = p.id.unwrap_or_else(|| format!("agent-{}", uuid_v4()));
+                let is_global = p.scope.as_deref() == Some("global");
+                let is_system = p.is_system.unwrap_or(false);
+                let tools_str = p.tools.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()));
+                let config_str = p.config.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()));
+
+                if is_global {
+                    let agent = self.with_global_db(move |db| {
+                        db.create_chat_agent(
+                            &id, &p.name, p.description.as_deref(),
+                            p.role.as_deref(), p.provider.as_deref(), p.model.as_deref(),
+                            p.system_prompt.as_deref(), tools_str.as_deref(),
+                            p.persona.as_deref(), p.persona_id.as_deref(),
+                            p.agency.as_deref(), p.role_type.as_deref(),
+                            p.scope.as_deref(), config_str.as_deref(), is_system,
+                        )
+                    }).await?;
+                    Ok(agent)
+                } else {
+                    let agent = self.with_db(move |db| {
+                        db.create_chat_agent(
+                            &id, &p.name, p.description.as_deref(),
+                            p.role.as_deref(), p.provider.as_deref(), p.model.as_deref(),
+                            p.system_prompt.as_deref(), tools_str.as_deref(),
+                            p.persona.as_deref(), p.persona_id.as_deref(),
+                            p.agency.as_deref(), p.role_type.as_deref(),
+                            p.scope.as_deref(), config_str.as_deref(), is_system,
+                        )
+                    }).await?;
+                    Ok(agent)
+                }
+            }
+
+            "chat/agent/get" => {
+                let p: IdParam = parse_params(params)?;
+                let id = p.id.clone();
+                let agent = self.with_db(move |db| db.get_chat_agent(&p.id)).await?;
+                if agent.is_some() {
+                    return Ok(agent.unwrap());
+                }
+                let agent = self.with_global_db(move |db| db.get_chat_agent(&id)).await?;
+                Ok(agent.unwrap_or(Value::Null))
+            }
+
+            "chat/agent/getByName" => {
+                let p: NameParam = parse_params(params)?;
+                let name = p.name.clone();
+                let agent = self.with_db(move |db| db.get_chat_agent_by_name(&p.name)).await?;
+                if agent.is_some() {
+                    return Ok(agent.unwrap());
+                }
+                let agent = self.with_global_db(move |db| db.get_chat_agent_by_name(&name)).await?;
+                Ok(agent.unwrap_or(Value::Null))
+            }
+
+            "chat/agent/list" => {
+                let p: AgentListParams = parse_params_optional(params);
+                let role_type = p.role_type.clone();
+                let include_system = p.include_system.unwrap_or(true);
+                let active_only = p.active_only.unwrap_or(false);
+                let limit = p.limit.unwrap_or(100);
+                let offset = p.offset.unwrap_or(0);
+
+                let role_type2 = role_type.clone();
+                let (project, global) = self.with_both_dbs(move |db| {
+                    db.list_chat_agents(role_type2.as_deref(), include_system, active_only, limit, offset)
+                }).await?;
+
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut merged = Vec::new();
+                for a in project {
+                    if let Some(id) = a.get("id").and_then(|v| v.as_str()) {
+                        seen.insert(id.to_string());
+                    }
+                    merged.push(a);
+                }
+                for a in global {
+                    if let Some(id) = a.get("id").and_then(|v| v.as_str()) {
+                        if !seen.contains(id) {
+                            merged.push(a);
+                        }
+                    }
+                }
+                Ok(json!({ "agents": merged }))
+            }
+
+            "chat/agent/update" => {
+                let p: AgentUpdateParams = parse_params(params)?;
+                let tools_str = p.tools.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "[]".into()));
+                let config_str = p.config.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()));
+
+                // Check project DB first
+                let in_project = self.with_db({
+                    let id = p.id.clone();
+                    move |db| db.get_chat_agent(&id)
+                }).await?;
+
+                if in_project.is_some() {
+                    let result = self.with_db(move |db| {
+                        db.update_chat_agent(
+                            &p.id, p.name.as_deref(), p.description.as_deref(),
+                            p.role.as_deref(), p.provider.as_deref(), p.model.as_deref(),
+                            p.system_prompt.as_deref(), tools_str.as_deref(),
+                            p.persona.as_deref(), p.persona_id.as_deref(),
+                            p.agency.as_deref(), p.role_type.as_deref(),
+                            p.scope.as_deref(), config_str.as_deref(), p.is_active,
+                        )
+                    }).await?;
+                    return Ok(result.unwrap_or(Value::Null));
+                }
+
+                // Fall back to global
+                let result = self.with_global_db(move |db| {
+                    db.update_chat_agent(
+                        &p.id, p.name.as_deref(), p.description.as_deref(),
+                        p.role.as_deref(), p.provider.as_deref(), p.model.as_deref(),
+                        p.system_prompt.as_deref(), tools_str.as_deref(),
+                        p.persona.as_deref(), p.persona_id.as_deref(),
+                        p.agency.as_deref(), p.role_type.as_deref(),
+                        p.scope.as_deref(), config_str.as_deref(), p.is_active,
+                    )
+                }).await?;
+                Ok(result.unwrap_or(Value::Null))
+            }
+
+            "chat/agent/delete" => {
+                let p: IdParam = parse_params(params)?;
+                let id = p.id.clone();
+                let deleted = self.with_db(move |db| db.delete_chat_agent(&p.id)).await?;
+                if deleted {
+                    return Ok(json!({ "success": true }));
+                }
+                let deleted = self.with_global_db(move |db| db.delete_chat_agent(&id)).await?;
+                Ok(json!({ "success": deleted }))
+            }
+
             _ => Err(ECPError::method_not_found(method)),
         }
     }
@@ -2429,6 +3230,12 @@ struct ToolCallListParams {
     #[serde(rename = "sessionId")]
     session_id: String,
     limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ToolCallUpdateInputParams {
+    id: String,
+    input: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -2625,6 +3432,119 @@ struct SessionAgentRemoveParams {
     session_id: String,
     #[serde(rename = "agentId")]
     agent_id: String,
+}
+
+#[derive(Deserialize)]
+struct NameParam {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct PersonaCreateParams {
+    id: Option<String>,
+    name: String,
+    description: Option<String>,
+    #[serde(rename = "problemSpace")]
+    problem_space: Option<String>,
+    #[serde(rename = "highLevel")]
+    high_level: Option<String>,
+    archetype: Option<String>,
+    principles: Option<String>,
+    taste: Option<String>,
+    compressed: Option<String>,
+    #[serde(rename = "pipelineStatus")]
+    pipeline_status: Option<String>,
+    avatar: Option<String>,
+    color: Option<String>,
+    scope: Option<String>,
+    #[serde(rename = "isSystem")]
+    is_system: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct PersonaListParams {
+    status: Option<String>,
+    #[serde(rename = "includeSystem")]
+    include_system: Option<bool>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct PersonaUpdateParams {
+    id: String,
+    name: Option<String>,
+    description: Option<String>,
+    #[serde(rename = "problemSpace")]
+    problem_space: Option<String>,
+    #[serde(rename = "highLevel")]
+    high_level: Option<String>,
+    archetype: Option<String>,
+    principles: Option<String>,
+    taste: Option<String>,
+    compressed: Option<String>,
+    #[serde(rename = "pipelineStatus")]
+    pipeline_status: Option<String>,
+    avatar: Option<String>,
+    color: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AgentCreateParams {
+    id: Option<String>,
+    name: String,
+    description: Option<String>,
+    role: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    #[serde(rename = "systemPrompt")]
+    system_prompt: Option<String>,
+    tools: Option<Value>,
+    persona: Option<String>,
+    #[serde(rename = "personaId")]
+    persona_id: Option<String>,
+    agency: Option<String>,
+    #[serde(rename = "roleType")]
+    role_type: Option<String>,
+    scope: Option<String>,
+    config: Option<Value>,
+    #[serde(rename = "isSystem")]
+    is_system: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct AgentListParams {
+    #[serde(rename = "roleType")]
+    role_type: Option<String>,
+    #[serde(rename = "includeSystem")]
+    include_system: Option<bool>,
+    #[serde(rename = "activeOnly")]
+    active_only: Option<bool>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct AgentUpdateParams {
+    id: String,
+    name: Option<String>,
+    description: Option<String>,
+    role: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    #[serde(rename = "systemPrompt")]
+    system_prompt: Option<String>,
+    tools: Option<Value>,
+    persona: Option<String>,
+    #[serde(rename = "personaId")]
+    persona_id: Option<String>,
+    agency: Option<String>,
+    #[serde(rename = "roleType")]
+    role_type: Option<String>,
+    scope: Option<String>,
+    config: Option<Value>,
+    #[serde(rename = "isActive")]
+    is_active: Option<bool>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
