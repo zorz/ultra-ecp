@@ -691,6 +691,82 @@ Once the ECP supports this, the Mac app will:
 
 ---
 
+## AI Bridge — Compiled Binary Support for App Bundle
+
+### Problem
+
+The Mac app bundles the Rust `ultra-ecp` binary at `Ultra.app/Contents/MacOS/ultra-ecp`. The AI bridge is compiled into a standalone Mach-O binary via `bun build index.ts --compile` and placed at `Ultra.app/Contents/MacOS/ai-bridge`.
+
+The current `main.rs` only looks for `ai-bridge/index.ts` (a script to run via bun). In the app bundle there is no `ai-bridge/index.ts` — only a compiled `ai-bridge` binary next to `ultra-ecp`. So the bridge fails to start and all AI/auth/agent/workflow/syntax services are unavailable.
+
+### Fix
+
+In `main.rs`, check for a compiled `ai-bridge` binary next to the executable **before** looking for the TypeScript source. When found, run it directly instead of via bun.
+
+**Detection logic** (check in this order):
+1. `exe_dir.join("ai-bridge")` — compiled binary next to ultra-ecp (app bundle case)
+2. `exe_dir.join("../../../ai-bridge/index.ts")` — dev: exe at `rust/target/release/` → project root
+3. `exe_dir.join("../../ai-bridge/index.ts")` — dev: exe at `rust/target/` → project root
+4. `PathBuf::from("ai-bridge/index.ts")` — CWD fallback
+
+When a compiled binary is found (case 1), spawn it directly — no runtime needed:
+```rust
+Command::new(compiled_binary_path)
+    .arg("--workspace").arg(workspace_root)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+```
+
+When a TypeScript source is found (cases 2-4), use the existing bun runtime approach:
+```rust
+Command::new(bun_runtime)
+    .arg("run").arg(script_path)
+    .arg("--workspace").arg(workspace_root)
+    ...
+```
+
+**Implementation options:**
+
+**Option A (minimal — main.rs only):** Detect the compiled binary in `main.rs` and set the `AIBridgeConfig` fields so the existing `start()` method works. Set `runtime` to the compiled binary path and `script_path` to a dummy/empty value, then skip the `"run"` arg. This is hacky but avoids changing the crate.
+
+**Option B (clean — config + lib change):** Add `compiled_binary: Option<PathBuf>` to `AIBridgeConfig`. In `AIBridge::start()`, branch:
+```rust
+let mut child = if let Some(ref bin) = config.compiled_binary {
+    Command::new(bin)
+        .arg("--workspace").arg(&config.workspace_root)
+        // ... stdin/stdout/stderr
+        .spawn()?
+} else {
+    Command::new(&config.runtime)
+        .arg("run").arg(&config.script_path)
+        .arg("--workspace").arg(&config.workspace_root)
+        // ... stdin/stdout/stderr
+        .spawn()?
+};
+```
+
+### App Bundle Layout
+
+```
+Ultra.app/
+  Contents/
+    MacOS/
+      Ultra          ← SwiftUI app binary
+      ultra-ecp      ← Rust ECP server (7MB)
+      ai-bridge      ← Compiled ai-bridge (bun --compile, ~70MB)
+    Resources/
+      config/themes/ ← Theme JSON files
+```
+
+The Xcode build script (`Scripts/build-ecp.sh`) handles:
+1. Copying `ultra-ecp/rust/target/release/ultra-ecp` → `Contents/MacOS/ultra-ecp`
+2. Compiling `ultra-ecp/ai-bridge/index.ts` → `Contents/MacOS/ai-bridge` via `bun build --compile`
+3. Code-signing both binaries
+
+---
+
 ## Methods NOT Needed
 
 These gap methods from RUST_MIGRATION.md are **not used** by the Mac app:
