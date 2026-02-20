@@ -27,11 +27,23 @@ export class AgentSessionRegistry {
   /** Available agents for delegation roster in system prompts */
   private availableAgents: Array<{ id: string; name: string; role?: string; description?: string }> = [];
 
+  /** Per-request workspace path resolver */
+  private workspacePathResolver: (() => string) | null = null;
+
   constructor(
     private service: LocalAIService,
     private getAgentConfig: (agentId: string) => IAgentConfig | undefined | Promise<IAgentConfig | undefined>,
     private workspaceRoot: string,
   ) {}
+
+  /** Set a per-request workspace path resolver for multi-workspace support. */
+  setWorkspacePathResolver(fn: () => string): void {
+    this.workspacePathResolver = fn;
+  }
+
+  private getWorkspacePath(): string {
+    return this.workspacePathResolver?.() ?? this.workspaceRoot;
+  }
 
   /**
    * Update the list of available agents for delegation roster.
@@ -97,7 +109,7 @@ export class AgentSessionRegistry {
     const systemPrompt = this.availableAgents.length > 1
       ? buildWorkflowAgentSystemPrompt(
           agentConfig,
-          this.workspaceRoot,
+          this.getWorkspacePath(),
           this.availableAgents,
           agentId,
           transcriptContext,
@@ -105,7 +117,7 @@ export class AgentSessionRegistry {
         )
       : buildAgentSystemPrompt(
           agentConfig,
-          this.workspaceRoot,
+          this.getWorkspacePath(),
           transcriptContext,
         );
 
@@ -120,7 +132,7 @@ export class AgentSessionRegistry {
       },
       systemPrompt,
       tools,
-      cwd: this.workspaceRoot,
+      cwd: this.getWorkspacePath(),
       metadata: {
         agentId,
         agentName: agentConfig?.name || agentId,

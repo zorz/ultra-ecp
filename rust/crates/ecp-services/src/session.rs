@@ -318,7 +318,7 @@ impl Service for SessionService {
                 let theme_id = self.settings.read()
                     .get("workbench.colorTheme")
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "catppuccin-mocha".to_string());
+                    .unwrap_or_else(|| "catppuccin-frappe".to_string());
                 let theme = load_theme(&theme_id).await;
                 Ok(json!({ "theme": theme }))
             }
@@ -334,8 +334,8 @@ impl Service for SessionService {
 
             "theme/list" => {
                 let mut themes = Vec::new();
-                // Scan config/themes/ directory for theme files
-                let theme_dirs = ["config/themes", "../config/themes"];
+                // Scan config/themes/ directory — check multiple locations
+                let theme_dirs = theme_search_dirs();
                 let mut found_dir = false;
                 for dir in &theme_dirs {
                     if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
@@ -561,7 +561,7 @@ fn default_settings() -> HashMap<String, Value> {
     s.insert("editor.wordWrap".into(), json!("off"));
     s.insert("editor.lineNumbers".into(), json!(true));
     s.insert("editor.minimap".into(), json!(false));
-    s.insert("workbench.colorTheme".into(), json!("catppuccin-mocha"));
+    s.insert("workbench.colorTheme".into(), json!("catppuccin-frappe"));
     s.insert("files.autoSave".into(), json!("afterDelay"));
     s.insert("files.autoSaveDelay".into(), json!(30000));
     s.insert("ultra.ai.model".into(), json!("claude-sonnet-4-20250514"));
@@ -571,15 +571,38 @@ fn default_settings() -> HashMap<String, Value> {
     s
 }
 
-/// Load a full theme from config/themes/{id}.json, falling back to catppuccin-mocha.
+/// Build the list of directories to search for theme files.
+/// Checks: ~/.ultra/config/themes, exe-relative (app bundle Resources/), CWD-relative, ../config/themes.
+fn theme_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    // ~/.ultra/config/themes/ — user-level theme storage
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(PathBuf::from(home).join(".ultra/config/themes"));
+    }
+
+    // Exe-relative: Contents/MacOS/ultra-ecp → Contents/Resources/config/themes (app bundle)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            dirs.push(exe_dir.join("../Resources/config/themes"));
+        }
+    }
+
+    // CWD-relative (dev: running from project root or rust/ subdir)
+    dirs.push(PathBuf::from("config/themes"));
+    dirs.push(PathBuf::from("../config/themes"));
+
+    dirs
+}
+
+/// Load a full theme from config/themes/{id}.json, falling back to catppuccin-frappe.
 async fn load_theme(id: &str) -> Value {
     let filename = format!("{id}.json");
 
-    // Search paths: CWD/config/themes/, ../config/themes/ (for running from rust/ subdir)
-    let candidates = [
-        PathBuf::from("config/themes").join(&filename),
-        PathBuf::from("../config/themes").join(&filename),
-    ];
+    let candidates: Vec<PathBuf> = theme_search_dirs()
+        .into_iter()
+        .map(|d| d.join(&filename))
+        .collect();
 
     let try_read = |paths: &[PathBuf]| {
         let paths = paths.to_vec();
@@ -595,12 +618,12 @@ async fn load_theme(id: &str) -> Value {
 
     let content = match try_read(&candidates).await {
         Some(c) => c,
-        None if id != "catppuccin-mocha" => {
+        None if id != "catppuccin-frappe" => {
             // Fall back to default theme
-            let fallback = [
-                PathBuf::from("config/themes/catppuccin-mocha.json"),
-                PathBuf::from("../config/themes/catppuccin-mocha.json"),
-            ];
+            let fallback: Vec<PathBuf> = theme_search_dirs()
+                .into_iter()
+                .map(|d| d.join("catppuccin-frappe.json"))
+                .collect();
             match try_read(&fallback).await {
                 Some(c) => c,
                 None => return json!({ "id": id, "name": id, "type": "dark", "colors": {}, "tokenColors": [] }),
@@ -631,7 +654,7 @@ fn config_schema() -> Value {
         "editor.wordWrap": { "type": "string", "default": "off", "description": "Word wrap mode" },
         "editor.lineNumbers": { "type": "boolean", "default": true, "description": "Show line numbers" },
         "editor.minimap": { "type": "boolean", "default": false, "description": "Show minimap" },
-        "workbench.colorTheme": { "type": "string", "default": "catppuccin-mocha", "description": "Color theme" },
+        "workbench.colorTheme": { "type": "string", "default": "catppuccin-frappe", "description": "Color theme" },
         "files.autoSave": { "type": "string", "default": "afterDelay", "description": "Auto-save mode" },
         "files.autoSaveDelay": { "type": "number", "default": 30000, "description": "Auto-save delay in ms" },
         "ultra.ai.model": { "type": "string", "default": "claude-sonnet-4-20250514", "description": "AI model" },

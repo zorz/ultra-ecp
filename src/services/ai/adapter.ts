@@ -143,8 +143,10 @@ export class AIServiceAdapter {
   private notificationHandler?: NotificationHandler;
   /** Todos per session (sessionId -> todos) */
   private sessionTodos: Map<string, AITodoItem[]> = new Map();
-  /** Workspace root for tool execution */
+  /** Workspace root for tool execution (startup default) */
   private workspaceRoot: string;
+  /** Per-request workspace path resolver (multi-workspace support) */
+  private workspacePathResolver: (() => string) | null = null;
   /** Chat orchestrator for multi-agent support */
   private chatOrchestrator: ChatOrchestrator | null = null;
   /** Agent service for studio agent registry */
@@ -172,6 +174,19 @@ export class AIServiceAdapter {
     this.service = service;
     this.workspaceRoot = workspaceRoot || process.cwd();
     this.setupEventHandlers();
+  }
+
+  /**
+   * Set a per-request workspace path resolver for multi-workspace support.
+   * When set, this function is called instead of using the static workspaceRoot.
+   */
+  setWorkspacePathResolver(fn: () => string): void {
+    this.workspacePathResolver = fn;
+  }
+
+  /** Get the effective workspace path (per-request resolver or startup default). */
+  private getWorkspacePath(): string {
+    return this.workspacePathResolver?.() ?? this.workspaceRoot;
   }
 
   /**
@@ -241,8 +256,12 @@ export class AIServiceAdapter {
 
         return config;
       },
-      this.workspaceRoot,
+      this.getWorkspacePath(),
     );
+    // Forward the workspace path resolver to the registry
+    if (this.workspacePathResolver) {
+      this.agentSessionRegistry.setWorkspacePathResolver(this.workspacePathResolver);
+    }
 
     debugLog('[AIServiceAdapter] ChatStorage set, AgentSessionRegistry initialized');
   }
@@ -410,8 +429,9 @@ export class AIServiceAdapter {
     if (this.agentsLoaded) return;
 
     try {
-      console.log('[AIServiceAdapter] Loading agents from workspace:', this.workspaceRoot || '(no workspace)');
-      const result = await loadAgents(this.workspaceRoot);
+      const wsPath = this.getWorkspacePath();
+      console.log('[AIServiceAdapter] Loading agents from workspace:', wsPath || '(no workspace)');
+      const result = await loadAgents(wsPath);
       console.log('[AIServiceAdapter] loadAgents returned:', result.agents.length, 'agents');
 
       // Register each agent with orchestrator (if available) and fallback storage
@@ -698,7 +718,7 @@ export class AIServiceAdapter {
         // The providers now handle both string[] and ToolDefinition[] formats
         tools: p.tools as unknown as CreateSessionOptions['tools'],
         messages: convertedMessages,
-        cwd: this.workspaceRoot,
+        cwd: this.getWorkspacePath(),
       };
 
       const session = await this.service.createSession(sessionOptions);
@@ -1604,7 +1624,7 @@ export class AIServiceAdapter {
           p.agentId,
           updates as Parameters<typeof updateAgentInConfig>[1],
           scope,
-          scope === 'project' ? this.workspaceRoot : undefined,
+          scope === 'project' ? this.getWorkspacePath() : undefined,
         );
 
         // Update the in-memory agent config
@@ -2079,7 +2099,7 @@ export class AIServiceAdapter {
       const session = await this.service.createSession({
         provider: { type: 'claude', name: 'Claude', model },
         systemPrompt: 'You are a concise writer. Output only the compressed persona text, nothing else.',
-        cwd: this.workspaceRoot,
+        cwd: this.getWorkspacePath(),
       });
 
       const response = await this.service.sendMessage({

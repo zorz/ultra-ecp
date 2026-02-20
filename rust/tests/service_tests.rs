@@ -1964,7 +1964,7 @@ mod session {
         let (_tmp, s) = svc();
 
         let result = s.handle("theme/current", None).await.unwrap();
-        assert_eq!(result["theme"]["id"], "catppuccin-mocha"); // default
+        assert_eq!(result["theme"]["id"], "catppuccin-frappe"); // default
         // Verify full theme data is loaded (colors and tokenColors)
         assert!(result["theme"]["colors"].is_object(), "theme should have colors object");
         assert!(result["theme"]["tokenColors"].is_array(), "theme should have tokenColors array");

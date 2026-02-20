@@ -22,7 +22,8 @@ import { createInterface } from "readline";
 import { AsyncLocalStorage } from "async_hooks";
 
 // Per-request workspace context — threaded through async call chains
-const workspaceContext = new AsyncLocalStorage<string | undefined>();
+interface WorkspaceCtx { id?: string; path?: string; }
+const workspaceContext = new AsyncLocalStorage<WorkspaceCtx>();
 
 // Import existing TypeScript services from the parent project
 import { LocalAIService } from "../src/services/ai/local.ts";
@@ -93,10 +94,10 @@ export async function callECPMethod(
     pendingCallbacks.set(callbackId, { resolve, reject });
 
     // Thread _workspaceId from the current request context into the callback
-    const wsId = workspaceContext.getStore();
+    const ctx = workspaceContext.getStore();
     const request: BridgeCallbackRequest = { callbackId, method, params };
-    if (wsId) {
-      request._workspaceId = wsId;
+    if (ctx?.id) {
+      request._workspaceId = ctx.id;
     }
     process.stdout.write(JSON.stringify(request) + "\n");
   });
@@ -143,6 +144,11 @@ async function initializeServices() {
     aiAdapter = new AIServiceAdapter(aiService, workspaceRoot);
     aiAdapter.setECPRequest(ecpRequestHandler);
     aiAdapter.setNotificationHandler(notificationHandler);
+    // Resolve workspace path per-request from AsyncLocalStorage context
+    aiAdapter.setWorkspacePathResolver(() => {
+      const ctx = workspaceContext.getStore();
+      return ctx?.path ?? workspaceRoot;
+    });
     await aiAdapter.loadAgentsFromConfig();
 
     // Wire PersonaService — delegates to Rust ChatService via callbacks
@@ -292,13 +298,17 @@ async function initializeServices() {
 
 async function handleRequest(req: BridgeRequest): Promise<BridgeResponse> {
   try {
-    // Extract _workspaceId from params (injected by Rust router for bridge-delegated services)
+    // Extract _workspaceId and _workspacePath from params (injected by Rust router)
     const params = { ...(req.params ?? {}) };
     const wsId = params._workspaceId as string | undefined;
+    const wsPath = params._workspacePath as string | undefined;
     delete params._workspaceId;
+    delete params._workspacePath;
 
     // Run dispatch within workspace context so callbacks include _workspaceId
-    const result = await workspaceContext.run(wsId, () =>
+    // and adapter methods use the correct workspace path
+    const ctx: WorkspaceCtx = { id: wsId, path: wsPath };
+    const result = await workspaceContext.run(ctx, () =>
       dispatch(req.method, params)
     );
     return { id: req.id, result };

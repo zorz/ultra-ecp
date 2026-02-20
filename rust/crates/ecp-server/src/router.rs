@@ -263,7 +263,7 @@ impl ECPServer {
         Ok(json!({ "workspaceClosed": true }))
     }
 
-    /// Inject _workspaceId into params for bridge-delegated services.
+    /// Inject _workspaceId and _workspacePath into params for bridge-delegated services.
     fn inject_workspace_id(
         &self,
         params: Option<Value>,
@@ -279,6 +279,10 @@ impl ECPServer {
                 None => serde_json::Map::new(),
             };
             obj.insert("_workspaceId".into(), json!(ws_id));
+            // Also inject the filesystem path so the bridge knows the project directory
+            if let Some(ws) = self.workspace_registry.get(ws_id) {
+                obj.insert("_workspacePath".into(), json!(ws.path.to_string_lossy()));
+            }
             Some(Value::Object(obj))
         } else {
             params

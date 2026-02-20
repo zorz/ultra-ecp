@@ -168,11 +168,21 @@ async fn main() {
         let mut bridge = AIBridge::new();
         bridge.set_notification_sender(notification_tx.clone());
 
-        // Resolve the bridge script path relative to the binary
+        // Resolve the bridge binary/script path relative to the executable
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
+
+        // Check for compiled ai-bridge binary next to ultra-ecp (app bundle case)
+        let compiled_binary = {
+            let candidate = exe_dir.join("ai-bridge");
+            if candidate.exists() && candidate.is_file() {
+                Some(candidate)
+            } else {
+                None
+            }
+        };
 
         // Look for ai-bridge/index.ts — binary is at rust/target/{debug,release}/ultra-ecp
         // so we need to go up 3 levels to reach the project root
@@ -185,21 +195,30 @@ async fn main() {
         .find(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("ai-bridge/index.ts"));
 
-        // Resolve bun runtime — Mac apps don't inherit the user's shell PATH
-        let bun_runtime = cli.bun_path.clone().unwrap_or_else(resolve_bun_path);
+        // Resolve bun runtime — only needed when running TS source (not compiled binary)
+        let bun_runtime = if compiled_binary.is_none() {
+            cli.bun_path.clone().unwrap_or_else(resolve_bun_path)
+        } else {
+            String::new()
+        };
 
         // Use the workspace root for bridge if provided, else cwd
         let bridge_workspace = workspace_root.clone()
             .unwrap_or_else(|| std::env::current_dir().expect("Failed to get cwd"));
 
         let config = AIBridgeConfig {
+            compiled_binary: compiled_binary.clone(),
             script_path: script_path.clone(),
             runtime: bun_runtime.clone(),
             workspace_root: bridge_workspace,
         };
 
-        println!("  AI Bridge:  runtime = {bun_runtime}");
-        println!("              script  = {}", script_path.display());
+        if let Some(ref bin) = compiled_binary {
+            println!("  AI Bridge:  compiled binary = {}", bin.display());
+        } else {
+            println!("  AI Bridge:  runtime = {bun_runtime}");
+            println!("              script  = {}", script_path.display());
+        }
 
         match bridge.start(config).await {
             Ok(()) => {

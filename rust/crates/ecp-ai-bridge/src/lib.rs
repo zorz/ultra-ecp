@@ -31,9 +31,11 @@ use tracing::{debug, info, warn};
 /// Configuration for the AI bridge subprocess.
 #[derive(Debug, Clone)]
 pub struct AIBridgeConfig {
-    /// Path to the TypeScript AI bridge entry point
+    /// Path to a compiled ai-bridge binary (app bundle). When set, run directly.
+    pub compiled_binary: Option<PathBuf>,
+    /// Path to the TypeScript AI bridge entry point (dev mode)
     pub script_path: PathBuf,
-    /// Runtime to use (bun, node, deno)
+    /// Runtime to use (bun, node, deno) — only used when compiled_binary is None
     pub runtime: String,
     /// Workspace root to pass to the bridge
     pub workspace_root: PathBuf,
@@ -42,6 +44,7 @@ pub struct AIBridgeConfig {
 impl Default for AIBridgeConfig {
     fn default() -> Self {
         Self {
+            compiled_binary: None,
             script_path: PathBuf::from("ai-bridge/index.ts"),
             runtime: "bun".into(),
             workspace_root: PathBuf::from("."),
@@ -153,24 +156,35 @@ impl AIBridge {
         let _ = self.callback_handler.set(handler);
     }
 
-    /// Start the TypeScript subprocess.
+    /// Start the bridge subprocess (compiled binary or TypeScript via runtime).
     pub async fn start(&mut self, config: AIBridgeConfig) -> Result<(), Box<dyn std::error::Error>> {
-        info!(
-            "Starting AI bridge: {} {}",
-            config.runtime,
-            config.script_path.display()
-        );
-
-        let mut child = Command::new(&config.runtime)
-            .arg("run")
-            .arg(&config.script_path)
-            .arg("--workspace")
-            .arg(&config.workspace_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to start AI bridge: {e}"))?;
+        let mut child = if let Some(ref bin) = config.compiled_binary {
+            info!("Starting AI bridge (compiled): {}", bin.display());
+            Command::new(bin)
+                .arg("--workspace")
+                .arg(&config.workspace_root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("Failed to start AI bridge (compiled): {e}"))?
+        } else {
+            info!(
+                "Starting AI bridge: {} {}",
+                config.runtime,
+                config.script_path.display()
+            );
+            Command::new(&config.runtime)
+                .arg("run")
+                .arg(&config.script_path)
+                .arg("--workspace")
+                .arg(&config.workspace_root)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("Failed to start AI bridge: {e}"))?
+        };
 
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
