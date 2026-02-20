@@ -9,6 +9,7 @@ pub mod jsonrpc;
 pub mod methods;
 pub mod notifications;
 pub mod auth;
+pub mod context;
 
 pub use error::{ECPError, ECPErrorCode};
 pub use jsonrpc::{
@@ -21,3 +22,4 @@ pub use auth::{
     AuthState, AuthConfig, AuthErrorCode,
     HandshakeParams, HandshakeResult, AuthRequiredParams,
 };
+pub use context::RequestContext;

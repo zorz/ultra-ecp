@@ -30,6 +30,14 @@ impl Service for AIService {
         "ai"
     }
 
+    fn scope(&self) -> crate::ServiceScope {
+        crate::ServiceScope::Global
+    }
+
+    fn is_bridge_delegated(&self) -> bool {
+        true
+    }
+
     async fn handle(&self, method: &str, params: Option<serde_json::Value>) -> HandlerResult {
         self.bridge.request(method, params).await
     }
@@ -50,6 +58,14 @@ impl AuthService {
 impl Service for AuthService {
     fn namespace(&self) -> &str {
         "auth"
+    }
+
+    fn scope(&self) -> crate::ServiceScope {
+        crate::ServiceScope::Global
+    }
+
+    fn is_bridge_delegated(&self) -> bool {
+        true
     }
 
     async fn handle(&self, method: &str, params: Option<serde_json::Value>) -> HandlerResult {
@@ -74,6 +90,14 @@ impl Service for AgentService {
         "agent"
     }
 
+    fn scope(&self) -> crate::ServiceScope {
+        crate::ServiceScope::Global
+    }
+
+    fn is_bridge_delegated(&self) -> bool {
+        true
+    }
+
     async fn handle(&self, method: &str, params: Option<serde_json::Value>) -> HandlerResult {
         self.bridge.request(method, params).await
     }
@@ -96,6 +120,14 @@ impl Service for WorkflowService {
         "workflow"
     }
 
+    fn scope(&self) -> crate::ServiceScope {
+        crate::ServiceScope::Global
+    }
+
+    fn is_bridge_delegated(&self) -> bool {
+        true
+    }
+
     async fn handle(&self, method: &str, params: Option<serde_json::Value>) -> HandlerResult {
         self.bridge.request(method, params).await
     }
@@ -116,6 +148,14 @@ impl SyntaxService {
 impl Service for SyntaxService {
     fn namespace(&self) -> &str {
         "syntax"
+    }
+
+    fn scope(&self) -> crate::ServiceScope {
+        crate::ServiceScope::Global
+    }
+
+    fn is_bridge_delegated(&self) -> bool {
+        true
     }
 
     async fn handle(&self, method: &str, params: Option<serde_json::Value>) -> HandlerResult {

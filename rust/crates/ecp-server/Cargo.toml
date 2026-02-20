@@ -15,3 +15,4 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 dashmap = { workspace = true }
 uuid = { workspace = true }
+parking_lot = { workspace = true }

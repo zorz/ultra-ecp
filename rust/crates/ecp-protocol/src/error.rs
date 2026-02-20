@@ -106,6 +106,14 @@ impl ECPError {
         Self::new(ECPErrorCode::ServerShuttingDown, "Server is shutting down")
     }
 
+    pub fn no_workspace() -> Self {
+        Self::new(ECPErrorCode::Custom(-32020), "No workspace opened. Send workspace/open first.")
+    }
+
+    pub fn workspace_not_found(id: &str) -> Self {
+        Self::new(ECPErrorCode::Custom(-32021), format!("Workspace not found: {id}"))
+    }
+
     pub fn error_code(&self) -> ECPErrorCode {
         ECPErrorCode::from_code(self.code)
     }

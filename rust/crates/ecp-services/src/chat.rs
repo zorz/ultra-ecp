@@ -209,6 +209,7 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted_into_id TEXT,
     is_complete INTEGER DEFAULT 1,
     iteration_number INTEGER DEFAULT 0,
+    blocks_json TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
     FOREIGN KEY (node_execution_id) REFERENCES node_executions(id) ON DELETE SET NULL,
@@ -592,12 +593,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 // Database wrapper (rusqlite is sync — we run it on spawn_blocking)
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct ChatDb {
+pub struct ChatDb {
     conn: rusqlite::Connection,
 }
 
 impl ChatDb {
-    fn open(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
+    pub fn open(path: &std::path::Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -685,6 +686,7 @@ impl ChatDb {
         self.ensure_column("messages", "feedback_target_agent_id", "TEXT");
         self.ensure_column("messages", "feedback_vote", "TEXT");
         self.ensure_column("messages", "feedback_status", "TEXT");
+        self.ensure_column("messages", "blocks_json", "TEXT");
 
         self.ensure_column("tool_calls", "node_execution_id", "TEXT");
         self.ensure_column("tool_calls", "agent_name", "TEXT");
@@ -872,7 +874,7 @@ impl ChatDb {
         model: Option<&str>, input_tokens: Option<i64>, output_tokens: Option<i64>,
         duration_ms: Option<i64>, agent_id: Option<&str>, agent_name: Option<&str>,
         agent_role: Option<&str>, tokens: Option<i64>, is_complete: Option<bool>,
-        iteration_number: Option<i64>,
+        iteration_number: Option<i64>, blocks_json: Option<&str>,
     ) -> Result<(), rusqlite::Error> {
         let now = now_ms() as i64;
         let is_complete_val = if is_complete.unwrap_or(true) { 1i32 } else { 0i32 };
@@ -880,10 +882,10 @@ impl ChatDb {
         self.conn.execute(
             "INSERT INTO messages (id, session_id, role, content, model, input_tokens, output_tokens,
              duration_ms, agent_id, agent_name, agent_role, tokens, is_active, is_complete,
-             iteration_number, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15)",
+             iteration_number, blocks_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15, ?16)",
             rusqlite::params![id, session_id, role, content, model, input_tokens, output_tokens,
-                duration_ms, agent_id, agent_name, agent_role, tokens, is_complete_val, iter_num, now],
+                duration_ms, agent_id, agent_name, agent_role, tokens, is_complete_val, iter_num, blocks_json, now],
         )?;
         // Touch session updated_at
         self.conn.execute("UPDATE sessions SET updated_at = ?1 WHERE id = ?2", rusqlite::params![now, session_id])?;
@@ -896,7 +898,7 @@ impl ChatDb {
                 "SELECT id, session_id, node_execution_id, role, content, agent_id, agent_name, agent_role,
                         model, input_tokens, output_tokens, tokens, duration_ms,
                         feedback_source_agent_id, feedback_target_agent_id, feedback_vote, feedback_status,
-                        is_active, compacted_into_id, is_complete, iteration_number, created_at
+                        is_active, compacted_into_id, is_complete, iteration_number, blocks_json, created_at
                  FROM messages WHERE session_id = ?1 AND is_active = 1 AND created_at > ?2
                  ORDER BY created_at ASC LIMIT ?3 OFFSET ?4"
             )?;
@@ -909,7 +911,7 @@ impl ChatDb {
                 "SELECT id, session_id, node_execution_id, role, content, agent_id, agent_name, agent_role,
                         model, input_tokens, output_tokens, tokens, duration_ms,
                         feedback_source_agent_id, feedback_target_agent_id, feedback_vote, feedback_status,
-                        is_active, compacted_into_id, is_complete, iteration_number, created_at
+                        is_active, compacted_into_id, is_complete, iteration_number, blocks_json, created_at
                  FROM messages WHERE session_id = ?1 AND is_active = 1
                  ORDER BY created_at ASC LIMIT ?2 OFFSET ?3"
             )?;
@@ -920,7 +922,7 @@ impl ChatDb {
         }
     }
 
-    fn update_message(&self, id: &str, content: Option<&str>, is_complete: Option<bool>, is_active: Option<bool>) -> Result<bool, rusqlite::Error> {
+    fn update_message(&self, id: &str, content: Option<&str>, is_complete: Option<bool>, is_active: Option<bool>, blocks_json: Option<&str>) -> Result<bool, rusqlite::Error> {
         let mut sets = Vec::new();
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1u32;
@@ -938,6 +940,11 @@ impl ChatDb {
         if let Some(ia) = is_active {
             sets.push(format!("is_active = ?{idx}"));
             params_vec.push(Box::new(if ia { 1i32 } else { 0i32 }));
+            idx += 1;
+        }
+        if let Some(bj) = blocks_json {
+            sets.push(format!("blocks_json = ?{idx}"));
+            params_vec.push(Box::new(bj.to_string()));
             idx += 1;
         }
 
@@ -965,7 +972,7 @@ impl ChatDb {
                 "SELECT id, session_id, node_execution_id, role, content, agent_id, agent_name, agent_role,
                         model, input_tokens, output_tokens, tokens, duration_ms,
                         feedback_source_agent_id, feedback_target_agent_id, feedback_vote, feedback_status,
-                        is_active, compacted_into_id, is_complete, iteration_number, created_at
+                        is_active, compacted_into_id, is_complete, iteration_number, blocks_json, created_at
                  FROM messages WHERE session_id = ?1 AND is_active = 1 AND content LIKE ?2
                  ORDER BY created_at DESC LIMIT ?3"
             )?;
@@ -976,7 +983,7 @@ impl ChatDb {
                 "SELECT id, session_id, node_execution_id, role, content, agent_id, agent_name, agent_role,
                         model, input_tokens, output_tokens, tokens, duration_ms,
                         feedback_source_agent_id, feedback_target_agent_id, feedback_vote, feedback_status,
-                        is_active, compacted_into_id, is_complete, iteration_number, created_at
+                        is_active, compacted_into_id, is_complete, iteration_number, blocks_json, created_at
                  FROM messages WHERE is_active = 1 AND content LIKE ?1
                  ORDER BY created_at DESC LIMIT ?2"
             )?;
@@ -990,7 +997,7 @@ impl ChatDb {
             "SELECT id, session_id, node_execution_id, role, content, agent_id, agent_name, agent_role,
                     model, input_tokens, output_tokens, tokens, duration_ms,
                     feedback_source_agent_id, feedback_target_agent_id, feedback_vote, feedback_status,
-                    is_active, compacted_into_id, is_complete, iteration_number, created_at
+                    is_active, compacted_into_id, is_complete, iteration_number, blocks_json, created_at
              FROM messages WHERE is_active = 1 ORDER BY created_at DESC LIMIT ?1"
         )?;
         let rows = stmt.query_map(rusqlite::params![limit], |row| message_row_to_json(row))?;
@@ -2117,7 +2124,8 @@ fn message_row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "compactedIntoId": row.get::<_, Option<String>>(18)?,
         "isComplete": row.get::<_, Option<i64>>(19)?.unwrap_or(1) == 1,
         "iterationNumber": row.get::<_, Option<i64>>(20)?.unwrap_or(0),
-        "createdAt": row.get::<_, i64>(21)?,
+        "blocksJson": row.get::<_, Option<String>>(21)?,
+        "createdAt": row.get::<_, i64>(22)?,
     }))
 }
 
@@ -2278,6 +2286,21 @@ impl ChatService {
         }
     }
 
+    /// Create a ChatService with a shared global database connection.
+    /// Used by WorkspaceRegistry to share a single global DB across workspaces.
+    pub fn new_with_global_db(
+        workspace_root: &std::path::Path,
+        global_db: Arc<Mutex<ChatDb>>,
+    ) -> Self {
+        let db_path = workspace_root.join(".ultra/chat.db");
+        let db = ChatDb::open(&db_path).expect("Failed to open project chat database");
+
+        Self {
+            db: Arc::new(Mutex::new(db)),
+            global_db,
+        }
+    }
+
     /// Run a blocking DB operation on the tokio blocking pool (project DB).
     async fn with_db<F, R>(&self, f: F) -> Result<R, ECPError>
     where
@@ -2410,6 +2433,7 @@ impl Service for ChatService {
                         p.model.as_deref(), p.input_tokens, p.output_tokens,
                         p.duration_ms, p.agent_id.as_deref(), p.agent_name.as_deref(),
                         p.agent_role.as_deref(), p.tokens, p.is_complete, p.iteration_number,
+                        p.blocks_json.as_deref(),
                     )
                 }).await?;
 
@@ -2419,7 +2443,7 @@ impl Service for ChatService {
             "chat/message/update" => {
                 let p: MessageUpdateParams = parse_params(params)?;
                 let updated = self.with_db(move |db| {
-                    db.update_message(&p.id, p.content.as_deref(), p.is_complete, p.is_active)
+                    db.update_message(&p.id, p.content.as_deref(), p.is_complete, p.is_active, p.blocks_json.as_deref())
                 }).await?;
                 Ok(json!({ "success": updated }))
             }
@@ -3164,6 +3188,8 @@ struct MessageAddParams {
     is_complete: Option<bool>,
     #[serde(rename = "iterationNumber")]
     iteration_number: Option<i64>,
+    #[serde(rename = "blocksJson")]
+    blocks_json: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3174,6 +3200,8 @@ struct MessageUpdateParams {
     is_complete: Option<bool>,
     #[serde(rename = "isActive")]
     is_active: Option<bool>,
+    #[serde(rename = "blocksJson")]
+    blocks_json: Option<String>,
 }
 
 #[derive(Deserialize)]

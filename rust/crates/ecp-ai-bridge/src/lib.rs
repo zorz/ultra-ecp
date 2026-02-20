@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 
-use ecp_protocol::{ECPError, ECPNotification, HandlerResult};
+use ecp_protocol::{ECPError, ECPNotification, HandlerResult, RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -51,7 +51,7 @@ impl Default for AIBridgeConfig {
 
 /// Callback handler type — executes a method against the ECP server's router.
 pub type CallbackHandler = Arc<
-    dyn Fn(&str, Option<Value>) -> Pin<Box<dyn Future<Output = HandlerResult> + Send>>
+    dyn Fn(&str, Option<Value>, RequestContext) -> Pin<Box<dyn Future<Output = HandlerResult> + Send>>
         + Send
         + Sync,
 >;
@@ -79,6 +79,8 @@ struct BridgeCallback {
     method: String,
     #[serde(default)]
     params: Option<Value>,
+    #[serde(rename = "_workspaceId", default)]
+    workspace_id: Option<String>,
 }
 
 /// Callback response sent back to the bridge.
@@ -245,8 +247,12 @@ impl AIBridge {
                             let handler = callback_handler.clone();
                             let writer = callback_writer.clone();
                             tokio::spawn(async move {
+                                let context = RequestContext {
+                                    client_id: "ai-bridge".into(),
+                                    workspace_id: cb.workspace_id.clone(),
+                                };
                                 let resp = if let Some(handler) = handler.get() {
-                                    match handler(&cb.method, cb.params).await {
+                                    match handler(&cb.method, cb.params, context).await {
                                         Ok(result) => BridgeCallbackResponse {
                                             callback_id: cb.callback_id,
                                             result: Some(result),

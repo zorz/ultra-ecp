@@ -19,6 +19,10 @@
  */
 
 import { createInterface } from "readline";
+import { AsyncLocalStorage } from "async_hooks";
+
+// Per-request workspace context — threaded through async call chains
+const workspaceContext = new AsyncLocalStorage<string | undefined>();
 
 // Import existing TypeScript services from the parent project
 import { LocalAIService } from "../src/services/ai/local.ts";
@@ -56,6 +60,7 @@ interface BridgeCallbackRequest {
   callbackId: string;
   method: string;
   params?: Record<string, unknown>;
+  _workspaceId?: string;
 }
 
 interface BridgeCallbackResponse {
@@ -87,7 +92,12 @@ export async function callECPMethod(
   return new Promise<unknown>((resolve, reject) => {
     pendingCallbacks.set(callbackId, { resolve, reject });
 
+    // Thread _workspaceId from the current request context into the callback
+    const wsId = workspaceContext.getStore();
     const request: BridgeCallbackRequest = { callbackId, method, params };
+    if (wsId) {
+      request._workspaceId = wsId;
+    }
     process.stdout.write(JSON.stringify(request) + "\n");
   });
 }
@@ -135,9 +145,58 @@ async function initializeServices() {
     aiAdapter.setNotificationHandler(notificationHandler);
     await aiAdapter.loadAgentsFromConfig();
 
+    // Wire PersonaService — delegates to Rust ChatService via callbacks
+    const bridgePersonaService = {
+      async getPersona(id: string) {
+        const result = await callECPMethod("chat/persona/get", { id });
+        return result ?? null;
+      },
+      async listPersonas(options?: Record<string, unknown>) {
+        const result = await callECPMethod("chat/persona/list", options ?? {});
+        return (result as any)?.personas ?? [];
+      },
+      async createPersona(options: Record<string, unknown>) {
+        return await callECPMethod("chat/persona/create", options);
+      },
+      async updatePersona(id: string, updates: Record<string, unknown>) {
+        return await callECPMethod("chat/persona/update", { id, ...updates });
+      },
+      async deletePersona(id: string) {
+        return (await callECPMethod("chat/persona/delete", { id }) as any)?.success ?? false;
+      },
+    };
+    aiAdapter.setPersonaService(bridgePersonaService as any);
+
+    // Wire ChatAgentService — delegates to Rust ChatService via callbacks
+    const bridgeChatAgentService = {
+      async getAgent(id: string) {
+        const result = await callECPMethod("chat/agent/get", { id });
+        return result ?? null;
+      },
+      async getAgentByName(name: string) {
+        const result = await callECPMethod("chat/agent/getByName", { name });
+        return result ?? null;
+      },
+      async listAgents(options?: Record<string, unknown>) {
+        const result = await callECPMethod("chat/agent/list", options ?? {});
+        return (result as any)?.agents ?? [];
+      },
+      async createAgent(options: Record<string, unknown>) {
+        return await callECPMethod("chat/agent/create", options);
+      },
+      async updateAgent(id: string, updates: Record<string, unknown>) {
+        return await callECPMethod("chat/agent/update", { id, ...updates });
+      },
+      async deleteAgent(id: string) {
+        return (await callECPMethod("chat/agent/delete", { id }) as any)?.success ?? false;
+      },
+    };
+    aiAdapter.setChatAgentService(bridgeChatAgentService as any);
+
     // Wire ChatStorage — delegates to Rust ChatService via callbacks.
-    // Methods are async because they cross the bridge boundary; the adapter
-    // awaits them (we patched sync → async in adapter.ts).
+    // IMPORTANT: This must come AFTER setPersonaService and setChatAgentService
+    // because setChatStorage creates AgentSessionRegistry whose resolver
+    // captures personaService and chatAgentService.
     const bridgeChatStorage = {
       async getMessages(sessionId: string, options?: { limit?: number; offset?: number; after?: number }) {
         const result = await callECPMethod("chat/message/list", {
@@ -206,6 +265,11 @@ async function initializeServices() {
     agentAdapter = new AgentServiceAdapter(agentService);
     agentAdapter.setNotificationHandler(notificationHandler);
 
+    // Wire agentService into AI adapter for unified agent listing
+    if (aiAdapter) {
+      aiAdapter.setAgentService(agentService);
+    }
+
     emitNotification("ai/bridge/service-ready", { service: "agent" });
   } catch (err: any) {
     process.stderr.write(`[ai-bridge] Failed to init agent service: ${err.message}\n`);
@@ -228,7 +292,15 @@ async function initializeServices() {
 
 async function handleRequest(req: BridgeRequest): Promise<BridgeResponse> {
   try {
-    const result = await dispatch(req.method, req.params ?? {});
+    // Extract _workspaceId from params (injected by Rust router for bridge-delegated services)
+    const params = { ...(req.params ?? {}) };
+    const wsId = params._workspaceId as string | undefined;
+    delete params._workspaceId;
+
+    // Run dispatch within workspace context so callbacks include _workspaceId
+    const result = await workspaceContext.run(wsId, () =>
+      dispatch(req.method, params)
+    );
     return { id: req.id, result };
   } catch (err: any) {
     return {

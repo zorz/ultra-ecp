@@ -18,7 +18,11 @@
     "test": "bun test",
     "test:protocol": "bun test tests/protocol/",
     "test:server": "bun test tests/server/",
-    "test:services": "bun test tests/services/"
+    "test:services": "bun test tests/services/",
+    "docs:ts": "typedoc --out docs/ts --entryPointStrategy expand src/server/ src/protocol/ src/services/ --tsconfig tsconfig.docs.json --skipErrorChecking",
+    "docs:rust": "cd rust && cargo doc --no-deps --document-private-items --workspace && echo 'Docs at rust/target/doc/'",
+    "docs": "bun run docs:ts && bun run docs:rust",
+    "docs:serve": "bun run docs && echo '\\nServing docs at http://localhost:8787' && bunx serve docs -l 8787"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.44",
@@ -31,6 +35,7 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "typedoc": "^0.28.17",
     "typescript": "^5.7.0"
   }
 }

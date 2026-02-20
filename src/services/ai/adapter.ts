@@ -220,16 +220,16 @@ export class AIServiceAdapter {
     // Now that we have all dependencies, create the agent session registry
     this.agentSessionRegistry = new AgentSessionRegistry(
       this.service,
-      (agentId) => {
+      async (agentId) => {
         const config = this.chatOrchestrator?.agentManager.getAgent(agentId)
                     ?? this.fallbackAgents.get(agentId);
         if (!config) return undefined;
 
         // Resolve persona compressed text if agent has personaId in database
         if (!config.personaCompressed && this.personaService && this.chatAgentService) {
-          const dbAgent = this.chatAgentService.getAgent(agentId);
+          const dbAgent = await Promise.resolve(this.chatAgentService.getAgent(agentId));
           if (dbAgent?.personaId) {
-            const persona = this.personaService.getPersona(dbAgent.personaId);
+            const persona = await Promise.resolve(this.personaService.getPersona(dbAgent.personaId));
             if (persona?.compressed) {
               return { ...config, personaCompressed: persona.compressed, agency: dbAgent.agency ?? config.agency };
             }

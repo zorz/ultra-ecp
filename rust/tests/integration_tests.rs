@@ -1,28 +1,28 @@
 //! End-to-end integration tests — WebSocket connection, auth handshake,
 //! and full JSON-RPC request/response cycle through the running server.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-/// Start a test server on a random port and return (port, auth_token).
+/// Start a test server on a random port with a pre-opened default workspace.
 async fn start_test_server() -> (u16, String) {
-    start_test_server_with_services(false).await
+    start_test_server_with_services().await
 }
 
-/// Start a test server with optional extra services.
-async fn start_test_server_with_services(full: bool) -> (u16, String) {
+/// Start a test server with all services via the workspace registry.
+async fn start_test_server_with_services() -> (u16, String) {
     use ecp_protocol::auth::AuthConfig;
-    use ecp_server::ECPServer;
+    use ecp_server::{ECPServer, WorkspaceRegistry};
     use ecp_services::{
-        chat::ChatService,
+        chat::ChatDb,
         document::DocumentService,
-        file::FileService,
-        session::SessionService,
     };
     use ecp_transport::server::{TransportConfig, TransportServer};
 
@@ -32,16 +32,25 @@ async fn start_test_server_with_services(full: bool) -> (u16, String) {
 
     let auth_token = format!("test-token-{}", std::process::id());
 
-    let mut ecp_server = ECPServer::new(workspace_path.clone());
-    ecp_server.register_service(FileService::new(workspace_path.clone()));
+    // Open global ChatDb for the registry
+    let global_chat_path = workspace_path.join(".ultra-global/chat.db");
+    let global_chat_db = Arc::new(Mutex::new(
+        ChatDb::open(&global_chat_path).expect("Failed to open global chat database"),
+    ));
+
+    let registry = WorkspaceRegistry::new(global_chat_db);
+    let mut ecp_server = ECPServer::new(registry);
+
+    // Register global services
     ecp_server.register_service(DocumentService::new());
 
-    if full {
-        ecp_server.register_service(ChatService::new(&workspace_path));
-        ecp_server.register_service(SessionService::new(workspace_path.clone()));
-    }
-
+    // Initialize global services
     ecp_server.initialize().await.unwrap();
+
+    // Pre-open a default workspace (backward compat behavior)
+    let (ws_id, _rx) = ecp_server.workspace_registry()
+        .open(&workspace_path, "__default__").await.unwrap();
+    ecp_server.set_default_workspace(ws_id);
 
     let config = TransportConfig {
         port: 0, // OS-assigned
@@ -369,7 +378,7 @@ async fn health_endpoint_works() {
 
 #[tokio::test]
 async fn chat_session_lifecycle_over_websocket() {
-    let (port, token) = start_test_server_with_services(true).await;
+    let (port, token) = start_test_server_with_services().await;
     let mut ws = connect_and_auth(port, &token).await;
 
     // Create a chat session
@@ -420,7 +429,7 @@ async fn chat_session_lifecycle_over_websocket() {
 
 #[tokio::test]
 async fn chat_document_lifecycle_over_websocket() {
-    let (port, token) = start_test_server_with_services(true).await;
+    let (port, token) = start_test_server_with_services().await;
     let mut ws = connect_and_auth(port, &token).await;
 
     // Create a session first (documents need a session)
@@ -507,4 +516,117 @@ async fn bridge_services_return_not_started_without_bridge() {
     let resp = send_request(&mut ws, 4, "syntax/highlight", None).await;
     assert!(resp.get("error").is_some());
     assert_eq!(resp["error"]["code"], -32601);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-workspace integration tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Start a test server WITHOUT a default workspace.
+async fn start_test_server_no_workspace() -> (u16, String) {
+    use ecp_protocol::auth::AuthConfig;
+    use ecp_server::{ECPServer, WorkspaceRegistry};
+    use ecp_services::{
+        chat::ChatDb,
+        document::DocumentService,
+    };
+    use ecp_transport::server::{TransportConfig, TransportServer};
+
+    let tmp = TempDir::new().unwrap();
+    let tmp_path = Box::leak(Box::new(tmp)).path().to_path_buf();
+
+    let auth_token = format!("test-token-{}", std::process::id());
+
+    let global_chat_path = tmp_path.join(".ultra-global/chat.db");
+    let global_chat_db = Arc::new(Mutex::new(
+        ChatDb::open(&global_chat_path).expect("Failed to open global chat database"),
+    ));
+
+    let registry = WorkspaceRegistry::new(global_chat_db);
+    let mut ecp_server = ECPServer::new(registry);
+    ecp_server.register_service(DocumentService::new());
+    ecp_server.initialize().await.unwrap();
+
+    let config = TransportConfig {
+        port: 0,
+        hostname: "127.0.0.1".into(),
+        auth: Some(AuthConfig {
+            token: auth_token.clone(),
+            handshake_timeout_ms: 5000,
+            allow_legacy_auth: true,
+            heartbeat_interval_ms: 30_000,
+        }),
+        enable_cors: false,
+        max_connections: Some(16),
+        workspace_root: None,
+        verbose_logging: false,
+    };
+
+    let transport = TransportServer::start(config, ecp_server).await.unwrap();
+    let port = transport.port();
+    Box::leak(Box::new(transport));
+
+    (port, auth_token)
+}
+
+#[tokio::test]
+async fn workspace_open_then_file_read() {
+    let (port, token) = start_test_server_no_workspace().await;
+    let mut ws = connect_and_auth(port, &token).await;
+
+    // Without workspace/open, file/read should fail with no_workspace
+    let resp = send_request(&mut ws, 1, "file/read", Some(json!({
+        "path": "/tmp/test.txt"
+    }))).await;
+    assert!(resp.get("error").is_some());
+    assert_eq!(resp["error"]["code"], -32020); // No workspace
+
+    // Create a temp workspace directory
+    let workspace = TempDir::new().unwrap();
+    let workspace_path = workspace.path().to_string_lossy().to_string();
+
+    // Open workspace
+    let resp = send_request(&mut ws, 2, "workspace/open", Some(json!({
+        "path": &workspace_path,
+    }))).await;
+    assert!(resp.get("result").is_some(), "workspace/open should succeed: {resp}");
+    assert!(resp["result"]["workspaceId"].is_string());
+
+    // Now file/write should work
+    let resp = send_request(&mut ws, 3, "file/write", Some(json!({
+        "path": "test.txt",
+        "content": "hello from multi-workspace",
+    }))).await;
+    assert_eq!(resp["result"]["success"], true, "file/write should succeed: {resp}");
+
+    // And file/read should work
+    let resp = send_request(&mut ws, 4, "file/read", Some(json!({
+        "path": "test.txt",
+    }))).await;
+    assert_eq!(resp["result"]["content"], "hello from multi-workspace");
+
+    // Close workspace
+    let resp = send_request(&mut ws, 5, "workspace/close", None).await;
+    assert_eq!(resp["result"]["workspaceClosed"], true);
+
+    // After close, file/read should fail again
+    let resp = send_request(&mut ws, 6, "file/read", Some(json!({
+        "path": "test.txt",
+    }))).await;
+    assert!(resp.get("error").is_some());
+    assert_eq!(resp["error"]["code"], -32020); // No workspace
+}
+
+#[tokio::test]
+async fn global_services_work_without_workspace() {
+    let (port, token) = start_test_server_no_workspace().await;
+    let mut ws = connect_and_auth(port, &token).await;
+
+    // Global document service should work without a workspace
+    let resp = send_request(&mut ws, 1, "document/open", Some(json!({
+        "uri": "file:///tmp/test.rs",
+        "content": "hello",
+        "languageId": "rust",
+    }))).await;
+    assert!(resp.get("result").is_some(), "Global document/open should work: {resp}");
 }

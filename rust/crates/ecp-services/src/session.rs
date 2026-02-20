@@ -12,15 +12,30 @@ use tracing::{debug, info};
 use crate::Service;
 
 /// Serialized session state.
+///
+/// The Swift client sends additional fields (e.g. `flexGuiState` with sidebar
+/// pinned/unpinned state, content tabs, etc.) that must survive round-tripping
+/// through setCurrent → markDirty → loadLast. The `#[serde(flatten)]` catch-all
+/// preserves all unknown fields without needing to enumerate them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionState {
     pub name: Option<String>,
+    #[serde(alias = "workspace_root")]
     pub workspace_root: Option<String>,
+    #[serde(default, alias = "open_files")]
     pub open_files: Vec<String>,
+    #[serde(alias = "active_file")]
     pub active_file: Option<String>,
+    #[serde(default)]
     pub settings: HashMap<String, Value>,
+    #[serde(default = "now_ms", alias = "created_at")]
     pub created_at: u64,
+    #[serde(default = "now_ms", alias = "updated_at")]
     pub updated_at: u64,
+    /// Catch-all for extra fields (flexGuiState, layout, ui, documents, etc.)
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 /// Session service — settings and session persistence.
@@ -161,6 +176,7 @@ impl Service for SessionService {
                     settings: self.settings.read().clone(),
                     created_at: now_ms(),
                     updated_at: now_ms(),
+                    extra: HashMap::new(),
                 };
 
                 let sessions_dir = self.sessions_dir.read().clone();
@@ -238,8 +254,26 @@ impl Service for SessionService {
             }
 
             "session/markDirty" => {
-                if let Some(ref mut session) = *self.current_session.write() {
-                    session.updated_at = now_ms();
+                let state_to_save = {
+                    let mut guard = self.current_session.write();
+                    if let Some(ref mut session) = *guard {
+                        session.updated_at = now_ms();
+                        Some(session.clone())
+                    } else {
+                        None
+                    }
+                };
+                // Persist to disk so flexGuiState survives server restarts
+                if let Some(state) = state_to_save {
+                    let sessions_dir = self.sessions_dir.read().clone();
+                    let _ = tokio::fs::create_dir_all(&sessions_dir).await;
+                    // Use workspace root hash as stable session filename
+                    let ws = state.workspace_root.as_deref().unwrap_or("default");
+                    let id = format!("workspace-{:x}", simple_hash(ws));
+                    let path = sessions_dir.join(format!("{id}.json"));
+                    if let Ok(json) = serde_json::to_string_pretty(&state) {
+                        let _ = tokio::fs::write(&path, json).await;
+                    }
                 }
                 Ok(json!({ "success": true }))
             }
@@ -508,6 +542,14 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Simple non-crypto hash for stable session filenames.
+fn simple_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn default_settings() -> HashMap<String, Value> {

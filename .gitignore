@@ -5,3 +5,7 @@ dist/
 
 # Rust
 rust/target/
+
+# Generated docs
+docs/ts/
+docs/rust

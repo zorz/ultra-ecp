@@ -418,6 +418,279 @@ And update `list_documents()` to handle the optional case — when `session_id` 
 
 ---
 
+## File Watcher — routing bug + URI format mismatch
+
+### Critical: Router doesn't dispatch `file/watch` to WatchService
+
+The WatchService has namespace `"watch"` but handles methods `"file/watch"` and `"file/unwatch"`. The router's exact-match loop finds `FileService` (namespace `"file"`) first, which returns `method_not_found`. The router returns this error immediately and **never reaches the fallback loop** that would try WatchService.
+
+**Result:** `file/watch` always fails. No watching ever happens. Clients silently get no file change events.
+
+**Swift workaround applied:** Changed to use `watch/start` and `watch/stop` which route correctly to WatchService's namespace.
+
+**Rust fix (recommended):** Either add `file/watch` forwarding in `FileService`, or change WatchService's namespace to `"file"` and merge with FileService, or fix the router to try the fallback loop when exact-match returns `method_not_found`.
+
+### URI format mismatch
+
+The `WatchService` emits file change notifications with **bare absolute paths** as URIs:
+
+```rust
+let uri = path.to_string_lossy().to_string();
+// Result: "/Users/keith/project/src/main.ts"
+```
+
+But the `FileService` uses `file://` prefixed URIs for tree nodes:
+
+```rust
+fn file_uri(path: &Path) -> String {
+    format!("file://{}", path.display())
+    // Result: "file:///Users/keith/project/src/main.ts"
+}
+```
+
+The Swift client normalizes incoming bare paths to `file://` URIs (workaround applied), but the Rust watcher should emit consistent URIs matching the rest of the ECP.
+
+### Also: `resolve_path` doesn't strip `file://` prefix
+
+When the client sends `{ "uri": "file://." }` to `file/watch`, the `resolve_path` function treats `"file://."` as a relative path and joins it with the workspace root, creating an invalid path like `/Users/keith/project/file://.`.
+
+### Fix
+
+1. In `watch.rs` event processor, emit `file://` prefixed URIs:
+
+```rust
+let uri = format!("file://{}", path.display());
+```
+
+2. In `resolve_path`, strip `file://` prefix before resolving:
+
+```rust
+fn resolve_path(&self, path: &str) -> PathBuf {
+    let stripped = path.strip_prefix("file://").unwrap_or(path);
+    let p = std::path::Path::new(stripped);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        self.workspace_root.join(stripped)
+    }
+}
+```
+
+---
+
+## `session/setCurrent` + `session/markDirty` — flexGuiState not persisted
+
+### Problem
+
+The Mac app saves workspace layout state (sidebar visibility, pinned state, widths, content tabs, etc.) via `session/setCurrent` with a `flexGuiState` dictionary, then calls `session/markDirty` to trigger persistence. The state is sent correctly — `WorkspaceStore.buildFlexGuiState()` includes `leftSidebarPinned`, `rightSidebarPinned`, and all other layout fields — but the ECP does not persist this state across restarts.
+
+On next launch, `session/loadLast` returns the session but the `flexGuiState` is either missing or stale, so sidebar pinned/unpinned state (and possibly other layout preferences) revert to defaults.
+
+### What the client sends
+
+On every layout change (debounced 1s), the client calls:
+
+```json
+{
+  "method": "session/setCurrent",
+  "params": {
+    "state": {
+      "workspaceRoot": "/Users/keith/project",
+      "flexGuiState": {
+        "version": 1,
+        "ui": {
+          "leftSidebarVisible": true,
+          "leftSidebarWidth": 210,
+          "leftSidebarPinned": false,
+          "rightSidebarVisible": true,
+          "rightSidebarWidth": 280,
+          "rightSidebarPinned": true,
+          "rightSidebarTab": "files",
+          "contentPanelVisible": true,
+          "contentPanelRatio": 0.5,
+          "followMode": false
+        },
+        "editorFiles": [...],
+        "chat": { "storageSessionId": "..." }
+      }
+    }
+  }
+}
+```
+
+Followed by:
+
+```json
+{ "method": "session/markDirty", "params": null }
+```
+
+### What the client reads on restore
+
+On startup, the client calls `session/loadLast` and reads `result.flexGuiState.ui` to restore all layout state including pinned sidebars.
+
+### Fix
+
+Ensure `session/setCurrent` persists the full `flexGuiState` object (or at minimum the `ui` sub-dictionary) to the session database, and that `session/loadLast` returns it intact.
+
+---
+
+## Multi-Workspace Support — Single ECP Server
+
+### Problem
+
+The Mac app currently spawns a **separate ECP server process per workstream** (per open project). Each process has its own WebSocket port, auth token, file watchers, git context, terminals, and chat database. This works but wastes resources — multiple processes, multiple databases, duplicated global state.
+
+### Goal
+
+A single ECP server process serves **all workstreams**. Each workstream opens its own WebSocket connection to the shared server. After authentication, the connection calls `workspace/open` to scope itself to a project directory. All subsequent requests on that connection are routed to workspace-specific service instances.
+
+### Architecture: Per-Connection Workspace Scoping
+
+The server already supports up to 32 simultaneous WebSocket connections with per-connection state (client UUID, auth status). The change is to add a **workspace context per connection**.
+
+```
+┌──────────────────────────────────────────────────────┐
+│              Single ECP Server Process                │
+│                                                      │
+│  Global Services (shared):                           │
+│  ├─ Auth, Models, Themes, Settings, AI Bridge        │
+│  └─ Global chat DB (~/.ultra/chat.db)                │
+│                                                      │
+│  Per-Workspace Services (created on workspace/open): │
+│  ├─ /project-a/ → File, Git, Watch, Terminal, Chat   │
+│  └─ /project-b/ → File, Git, Watch, Terminal, Chat   │
+│                                                      │
+│  Connection → Workspace mapping:                     │
+│  ├─ ws-conn-1 → /project-a/                          │
+│  ├─ ws-conn-2 → /project-b/                          │
+│  └─ ws-conn-3 → /project-a/ (shared services)       │
+└──────────────────────────────────────────────────────┘
+```
+
+### New Methods
+
+#### `workspace/open`
+
+Called after `auth/handshake`. Scopes the connection to a workspace directory.
+
+```json
+{
+  "method": "workspace/open",
+  "params": { "path": "/Users/keith/Development/project-a" }
+}
+```
+
+**Behavior:**
+- Creates a new set of per-workspace services (FileService, GitService, WatchService, TerminalService, ChatService, LSPService) initialized with the given path as workspace root
+- If services already exist for that path (another connection opened the same workspace), reuses them (reference-counted)
+- Associates the calling connection with that workspace — all subsequent requests on this connection route to these services
+- Opens (or reuses) `workspace_root/.ultra/chat.db` as the project database
+
+**Response:**
+```json
+{
+  "result": {
+    "workspaceId": "ws-uuid-here",
+    "path": "/Users/keith/Development/project-a"
+  }
+}
+```
+
+#### `workspace/close`
+
+Called when a workstream tab is closed.
+
+```json
+{
+  "method": "workspace/close",
+  "params": { "workspaceId": "ws-uuid-here" }
+}
+```
+
+**Behavior:**
+- Dissociates the connection from the workspace
+- Decrements the reference count for that workspace's services
+- When refcount reaches 0: stops file watchers, kills terminals, shuts down LSP servers, closes the project chat database
+
+### Per-Connection Request Routing
+
+After `workspace/open`, the router resolves `connection → workspace → services` instead of using a global singleton:
+
+```
+Request arrives on connection C
+  → Look up C's workspace (set by workspace/open)
+  → Route to that workspace's FileService / GitService / etc.
+```
+
+**No changes to existing method signatures.** Methods like `file/read`, `git/status`, `terminal/create` stay exactly the same — the workspace context is implicit from the connection, not passed as a parameter.
+
+### Per-Workspace Notifications
+
+Notifications must only be sent to connections registered for the relevant workspace:
+
+| Notification | Scope | Routing |
+|-------------|-------|---------|
+| `file/didChange`, `file/didCreate`, `file/didDelete` | Per-workspace | Only connections for that workspace |
+| `git/*` events | Per-workspace | Only connections for that workspace |
+| `terminal/output`, `terminal/exit` | Per-workspace | Only connections for that workspace |
+| `chat/*` notifications | Per-workspace | Only connections for that workspace |
+| `theme/didChange` | Global | All connections |
+| `config/didChange` | Global | All connections |
+
+**Implementation:** Replace the single broadcast channel with per-workspace broadcast channels. Global notifications use a separate global channel that all connections subscribe to.
+
+### Startup Changes
+
+- `--workspace` CLI arg becomes **optional** (defaults to `~` for the lobby)
+- Per-workspace services are **not** created at server start — created lazily on `workspace/open`
+- Global services (Auth, Models, Themes, Settings, AI Bridge) still initialize at startup
+- The server starts and listens for connections without needing a workspace
+
+### Services: Global vs Per-Workspace
+
+**Global (shared across all workspaces):**
+
+| Service | Why Global |
+|---------|-----------|
+| Auth | Single token per server instance |
+| Models | User-level `~/.ultra/models.json` |
+| Themes | User-level `~/.ultra/config/themes/` |
+| Settings | User-level `~/.ultra/settings.jsonc` (base layer) |
+| AI Bridge | Single subprocess, stateless per-request |
+| Global Chat DB | `~/.ultra/chat.db` for cross-project data |
+
+**Per-Workspace (instantiated on `workspace/open`):**
+
+| Service | Notes |
+|---------|-------|
+| FileService | Own root, own path resolution |
+| GitService | Own repo context, own working directory |
+| WatchService | Own file system watchers |
+| TerminalService | Own shell processes (cwd = workspace root) |
+| ChatService | Own `workspace/.ultra/chat.db` + shared global DB |
+| SessionService | Workspace-level settings overlay |
+| LSPService | Own language server instances per language |
+
+### Mac App Changes (for reference)
+
+Once the ECP supports this, the Mac app will:
+
+1. Move `ServerLauncher` from per-`Workstream` to `AppState` (single server process)
+2. Each `Workstream` opens its own WebSocket connection to `127.0.0.1:<port>`
+3. After `auth/handshake`, each connection calls `workspace/open` with its project path
+4. On workstream close, calls `workspace/close` then disconnects
+5. Health monitor moves to `AppState` level (one server to monitor, restart restores all connections)
+
+### Why Per-Connection (Not Per-Request workspaceId)
+
+- **No changes to existing method signatures** — `file/read`, `git/status`, etc. stay the same
+- **Router already has per-connection context** (client UUID) — just add workspace to it
+- **Mac app already uses one connection per workstream** — maps naturally
+- **Notifications are already per-connection** — just filter by workspace
+- **Simpler client code** — no need to thread workspaceId through every store method
+
+---
+
 ## Methods NOT Needed
 
 These gap methods from RUST_MIGRATION.md are **not used** by the Mac app:
@@ -426,3 +699,37 @@ These gap methods from RUST_MIGRATION.md are **not used** by the Mac app:
 - `shell/openExternal` — handled client-side via `NSWorkspace`
 - `shell/rebuild` — not used
 - `layout/*` (all 10 methods) — layout is managed entirely client-side in `WorkspaceStore`
+
+---
+
+## Known Bugs
+
+### Tool execution blocks not persisting across app reloads — FIXED
+
+~~**Symptom:** Tool execution blocks missing after reload.~~
+
+**Fixed:** The Rust ECP's `messages` table now has a `blocks_json TEXT` column (matching TS migration 007). Changes:
+- Schema: `blocks_json TEXT` added to `UNIFIED_SCHEMA` DDL
+- Migration: `ensure_column("messages", "blocks_json", "TEXT")` for existing databases
+- `MessageAddParams` + `MessageUpdateParams`: accept `blocksJson` field
+- `add_message()`: stores `blocks_json` in INSERT
+- `update_message()`: supports updating `blocks_json`
+- All 5 message SELECT queries + `message_row_to_json()`: include `blocksJson` in output
+
+Full persistence path: Swift sends `blocksJson` via `chat/message/add` → Rust stores in `blocks_json` column → Swift reads via `chat/message/list` response.
+
+### `session/setCurrent` + `session/markDirty` not persisting flexGuiState — FIXED
+
+~~**Symptom:** Sidebar pinned state not restored on reload.~~
+
+**Fixed:** Two bugs were causing this:
+1. `SessionState` struct only had typed fields — `flexGuiState` was silently dropped during deserialization. **Fix:** Added `#[serde(flatten)] pub extra: HashMap<String, Value>` catch-all to preserve all unknown fields.
+2. `session/markDirty` only updated `updated_at` in memory — no disk persistence. **Fix:** `markDirty` now writes the full session state to `~/.ultra/sessions/workspace-{hash}.json`.
+
+The `SessionState` struct also uses `#[serde(rename_all = "camelCase")]` with `alias` attributes for backward compatibility with old snake_case session files.
+
+### File watcher notifications not reaching clients — FIXED
+
+~~**Symptom:** File changes not reflected in editor or file tree after multi-workspace refactor.~~
+
+**Fixed:** The multi-workspace refactor moved WatchService notifications from the global broadcast channel to per-workspace channels. But clients using the `--workspace` default (without calling `workspace/open`) never subscribed to the per-workspace channel. **Fix:** Added `default_workspace_id()` to `RequestHandler` trait. Transport auto-subscribes to the default workspace's notification channel immediately after authentication.

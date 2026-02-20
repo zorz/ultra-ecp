@@ -1,12 +1,14 @@
-//! Ultra ECP — Editor Command Protocol Server
+//! Ultra ECP — Editor Command Protocol Server (multi-workspace)
 //!
-//! A standalone server that exposes development environment services
-//! over JSON-RPC 2.0 via WebSocket.
+//! A single-process server that exposes development environment services
+//! over JSON-RPC 2.0 via WebSocket. Supports multiple workspaces
+//! concurrently — each connection calls `workspace/open` to scope itself
+//! to a project directory.
 //!
 //! Usage:
-//!   ultra-ecp                                    # Default port 7070, cwd as workspace
+//!   ultra-ecp                                    # Default port 7070, no workspace
 //!   ultra-ecp --port 8080                        # Custom port
-//!   ultra-ecp --workspace /path/to/project       # Custom workspace
+//!   ultra-ecp --workspace /path/to/project       # Pre-open a default workspace
 //!   ultra-ecp --token mysecret                   # Custom auth token
 
 use std::path::PathBuf;
@@ -15,24 +17,17 @@ use std::sync::Arc;
 use clap::Parser;
 use ecp_ai_bridge::{AIBridge, AIBridgeConfig};
 use ecp_protocol::auth::AuthConfig;
-use ecp_protocol::ECPNotification;
-use ecp_server::ECPServer;
+use ecp_server::{ECPServer, WorkspaceRegistry};
 use ecp_services::{
     bridge_services::{AIService, AgentService, AuthService, SyntaxService, WorkflowService},
-    chat::ChatService,
-    database::DatabaseService,
+    chat::ChatDb,
     document::DocumentService,
-    file::FileService,
-    git::GitService,
-    lsp::LSPService,
     models::ModelsService,
     secret::SecretService,
-    session::SessionService,
-    terminal::TerminalService,
-    watch::WatchService,
 };
 use ecp_transport::server::{TransportConfig, TransportServer};
 use ecp_transport::RequestHandler;
+use parking_lot::Mutex;
 use tokio::sync::broadcast;
 use tracing::{error, warn};
 use tracing_subscriber::EnvFilter;
@@ -48,7 +43,7 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     hostname: String,
 
-    /// Workspace root directory
+    /// Workspace root directory (pre-opens a default workspace for backward compat)
     #[arg(long)]
     workspace: Option<PathBuf>,
 
@@ -120,11 +115,11 @@ async fn main() {
         .with_env_filter(filter)
         .init();
 
-    let workspace_root = cli.workspace
-        .unwrap_or_else(|| std::env::current_dir().expect("Failed to get cwd"));
-
-    let workspace_root = workspace_root.canonicalize()
-        .unwrap_or(workspace_root);
+    // Resolve workspace root if provided
+    let workspace_root = cli.workspace.map(|w| {
+        let w = w.canonicalize().unwrap_or(w);
+        w
+    });
 
     // Generate auth token
     let auth_token = cli.token.unwrap_or_else(|| {
@@ -137,45 +132,36 @@ async fn main() {
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                     Ultra ECP Server                        ║");
-    println!("║                        (Rust)                               ║");
+    println!("║                   (Rust, multi-workspace)                   ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
-    println!("  Workspace:  {}", workspace_root.display());
+    if let Some(ref ws) = workspace_root {
+        println!("  Workspace:  {} (default)", ws.display());
+    } else {
+        println!("  Workspace:  (none — clients must call workspace/open)");
+    }
     println!("  Port:       {}", cli.port);
     println!("  Binding:    {} (localhost only)", cli.hostname);
     println!();
 
-    // Create shared notification channel — services and transport share this
+    // Open global ChatDb — shared across all workspaces
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let global_chat_path = PathBuf::from(&home).join(".ultra/chat.db");
+    let global_chat_db = Arc::new(Mutex::new(
+        ChatDb::open(&global_chat_path).expect("Failed to open global chat database"),
+    ));
+
+    // Create shared notification channel — global notifications (theme, config)
     let (notification_tx, _) = broadcast::channel::<String>(1024);
 
-    // Create the ECP server
-    let mut ecp_server = ECPServer::new(workspace_root.clone());
+    // Create workspace registry and ECP server
+    let registry = WorkspaceRegistry::new(global_chat_db);
+    let mut ecp_server = ECPServer::new(registry);
     ecp_server.set_notification_sender(notification_tx.clone());
 
-    // Build a notification callback for services that emit events
-    let notify_tx = notification_tx.clone();
-    let notify_sender: Arc<dyn Fn(&str, serde_json::Value) + Send + Sync> = Arc::new(move |method, params| {
-        let notification = ECPNotification::new(method, Some(params));
-        if let Ok(json) = serde_json::to_string(&notification) {
-            let _ = notify_tx.send(json);
-        }
-    });
-
-    // Create watch service with notification wiring
-    let watch_service = WatchService::new(workspace_root.clone());
-    watch_service.set_notify_sender(notify_sender);
-
-    // Register core services (handled natively in Rust)
-    ecp_server.register_service(FileService::new(workspace_root.clone()));
-    ecp_server.register_service(GitService::new(workspace_root.clone()));
-    ecp_server.register_service(TerminalService::new(workspace_root.clone()));
-    ecp_server.register_service(DocumentService::new());
-    ecp_server.register_service(SessionService::new(workspace_root.clone()));
+    // Register global services
     ecp_server.register_service(SecretService::new());
-    ecp_server.register_service(ChatService::new(&workspace_root));
-    ecp_server.register_service(DatabaseService::new(workspace_root.clone()));
-    ecp_server.register_service(LSPService::new(workspace_root.clone()));
-    ecp_server.register_service(watch_service);
+    ecp_server.register_service(DocumentService::new());
 
     // ── AI Bridge — TypeScript subprocess for AI SDK services ────────────
     let bridge_arc: Option<Arc<AIBridge>> = if !cli.no_bridge {
@@ -194,20 +180,22 @@ async fn main() {
             exe_dir.join("../../../ai-bridge/index.ts"),  // exe → project root
             exe_dir.join("../../ai-bridge/index.ts"),     // exe → rust/
             PathBuf::from("ai-bridge/index.ts"),          // CWD
-            workspace_root.join("ai-bridge/index.ts"),    // workspace
         ]
         .into_iter()
         .find(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("ai-bridge/index.ts"));
 
-        // Resolve bun runtime — Mac apps don't inherit the user's shell PATH,
-        // so check common installation locations
+        // Resolve bun runtime — Mac apps don't inherit the user's shell PATH
         let bun_runtime = cli.bun_path.clone().unwrap_or_else(resolve_bun_path);
+
+        // Use the workspace root for bridge if provided, else cwd
+        let bridge_workspace = workspace_root.clone()
+            .unwrap_or_else(|| std::env::current_dir().expect("Failed to get cwd"));
 
         let config = AIBridgeConfig {
             script_path: script_path.clone(),
             runtime: bun_runtime.clone(),
-            workspace_root: workspace_root.clone(),
+            workspace_root: bridge_workspace,
         };
 
         println!("  AI Bridge:  runtime = {bun_runtime}");
@@ -217,21 +205,20 @@ async fn main() {
             Ok(()) => {
                 let bridge = Arc::new(bridge);
 
-                // Register bridge-delegated services
+                // Register bridge-delegated services (global)
                 ecp_server.register_service(AIService::new(bridge.clone()));
                 ecp_server.register_service(AuthService::new(bridge.clone()));
                 ecp_server.register_service(AgentService::new(bridge.clone()));
                 ecp_server.register_service(WorkflowService::new(bridge.clone()));
                 ecp_server.register_service(SyntaxService::new(bridge.clone()));
 
-                println!("  AI Bridge:  started (6 services delegated)");
+                println!("  AI Bridge:  started (5 services delegated)");
                 Some(bridge)
             }
             Err(e) => {
                 warn!("AI bridge failed to start: {e}");
                 println!("  AI Bridge:  FAILED ({e})");
-                println!("              AI/auth/agent/workflow/syntax/models services unavailable");
-                println!("              (models/list will fall back to file read)");
+                println!("              AI/auth/agent/workflow/syntax services unavailable");
                 None
             }
         }
@@ -243,24 +230,36 @@ async fn main() {
     ecp_server.register_service(ModelsService::new(bridge_arc.clone()));
     println!();
 
-    // Initialize all services
+    // Initialize global services
     if let Err(e) = ecp_server.initialize().await {
         error!("Failed to initialize ECP server: {e}");
         std::process::exit(1);
+    }
+
+    // Pre-open default workspace if --workspace was provided
+    if let Some(ref ws_root) = workspace_root {
+        match ecp_server.workspace_registry().open(ws_root, "__default__").await {
+            Ok((ws_id, _rx)) => {
+                ecp_server.set_default_workspace(ws_id.clone());
+                println!("  Default workspace opened: {}", ws_root.display());
+            }
+            Err(e) => {
+                error!("Failed to open default workspace: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     // Wrap ECPServer in Arc — shared between transport and bridge callback handler
     let ecp_server = Arc::new(ecp_server);
 
     // Wire the bridge callback handler now that the ECPServer is in an Arc.
-    // This lets the Agent SDK call ECP tools (file/read, git/status, etc.)
-    // by routing callbacks through the full ECP server router.
     if let Some(ref bridge) = bridge_arc {
         let server = ecp_server.clone();
-        bridge.set_callback_handler(Arc::new(move |method, params| {
+        bridge.set_callback_handler(Arc::new(move |method, params, context| {
             let server = server.clone();
             let method = method.to_string();
-            Box::pin(async move { server.handle_request(&method, params).await })
+            Box::pin(async move { server.handle_request(&method, params, context).await })
         }));
     }
 
@@ -276,7 +275,7 @@ async fn main() {
         }),
         enable_cors: false,
         max_connections: Some(cli.max_connections),
-        workspace_root: Some(workspace_root.to_string_lossy().to_string()),
+        workspace_root: workspace_root.as_ref().map(|w| w.to_string_lossy().to_string()),
         verbose_logging: cli.verbose,
     };
 

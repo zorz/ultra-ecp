@@ -18,7 +18,7 @@ use axum::{
     routing::get,
 };
 use ecp_protocol::{
-    ECPNotification, ECPResponse, ECPError,
+    ECPNotification, ECPResponse, ECPError, RequestContext,
     auth::{
         AuthConfig, AuthErrorCode, AuthRequiredParams,
         HandshakeParams, HandshakeResult,
@@ -38,7 +38,31 @@ pub trait RequestHandler: Send + Sync + 'static {
         &self,
         method: &str,
         params: Option<serde_json::Value>,
+        context: RequestContext,
     ) -> impl std::future::Future<Output = ecp_protocol::HandlerResult> + Send;
+
+    /// Called when a client disconnects (graceful or not).
+    fn on_client_disconnected(
+        &self,
+        _client_id: &str,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
+    /// Get a per-workspace notification receiver (called after workspace/open).
+    fn workspace_notification_rx(
+        &self,
+        _workspace_id: &str,
+    ) -> Option<broadcast::Receiver<String>> {
+        None
+    }
+
+    /// Return the default workspace ID (from --workspace flag), if any.
+    /// Used by the transport to auto-subscribe clients to workspace notifications
+    /// when they don't explicitly call workspace/open.
+    fn default_workspace_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Transport server configuration.
@@ -228,8 +252,12 @@ async fn handle_ws_connection<H: RequestHandler>(
 
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Subscribe to broadcast notifications
+    // Subscribe to global broadcast notifications
     let mut notification_rx = state.notification_tx.subscribe();
+
+    // Per-connection workspace state (set after workspace/open)
+    let mut workspace_id: Option<String> = None;
+    let mut workspace_notification_rx: Option<broadcast::Receiver<String>> = None;
 
     // Determine initial auth state
     let requires_auth = state.config.auth.is_some();
@@ -252,6 +280,11 @@ async fn handle_ws_connection<H: RequestHandler>(
         }
     } else {
         send_welcome(&mut ws_tx, &client_id, &state.config).await;
+        // Auto-subscribe to default workspace when auth is disabled
+        if let Some(default_ws_id) = state.handler.default_workspace_id() {
+            workspace_id = Some(default_ws_id.clone());
+            workspace_notification_rx = state.handler.workspace_notification_rx(&default_ws_id);
+        }
     }
 
     // Auth timeout — use a concrete sleep that we pin
@@ -286,6 +319,13 @@ async fn handle_ws_connection<H: RequestHandler>(
                                     let _ = ws_tx.send(Message::Text(response.into())).await;
                                     send_welcome(&mut ws_tx, &client_id, &state.config).await;
                                     debug!("Client authenticated: {client_id}");
+
+                                    // Auto-subscribe to default workspace notifications
+                                    // for clients that won't explicitly call workspace/open
+                                    if let Some(default_ws_id) = state.handler.default_workspace_id() {
+                                        workspace_id = Some(default_ws_id.clone());
+                                        workspace_notification_rx = state.handler.workspace_notification_rx(&default_ws_id);
+                                    }
                                 }
                                 HandshakeOutcome::Rejected(response) => {
                                     let _ = ws_tx.send(Message::Text(response.into())).await;
@@ -299,8 +339,24 @@ async fn handle_ws_connection<H: RequestHandler>(
                             continue;
                         }
 
+                        // Build request context for this message
+                        let context = RequestContext {
+                            client_id: client_id.clone(),
+                            workspace_id: workspace_id.clone(),
+                        };
+
                         // Parse and route authenticated message
-                        let response = handle_message(&text, &state.handler).await;
+                        let response = handle_message(&text, &state.handler, context).await;
+
+                        // Check if this was a workspace/open success — update local state
+                        if let Some((ws_id, ws_rx)) = extract_workspace_open_result(&response, &state.handler) {
+                            workspace_id = Some(ws_id);
+                            workspace_notification_rx = ws_rx;
+                        } else if is_workspace_close_success(&response) {
+                            workspace_id = None;
+                            workspace_notification_rx = None;
+                        }
+
                         if let Err(e) = ws_tx.send(Message::Text(response.into())).await {
                             error!("Failed to send response to {client_id}: {e}");
                             break;
@@ -321,12 +377,29 @@ async fn handle_ws_connection<H: RequestHandler>(
                 }
             }
 
-            // Broadcast notifications to this client
+            // Global broadcast notifications
             notification = notification_rx.recv() => {
                 if authenticated {
                     if let Ok(msg) = notification {
                         if let Err(e) = ws_tx.send(Message::Text(msg.into())).await {
                             error!("Failed to broadcast to {client_id}: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Per-workspace notifications
+            notification = async {
+                match &mut workspace_notification_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if authenticated {
+                    if let Ok(msg) = notification {
+                        if let Err(e) = ws_tx.send(Message::Text(msg.into())).await {
+                            error!("Failed to send workspace notification to {client_id}: {e}");
                             break;
                         }
                     }
@@ -348,6 +421,9 @@ async fn handle_ws_connection<H: RequestHandler>(
             }
         }
     }
+
+    // Notify the handler that this client disconnected
+    state.handler.on_client_disconnected(&client_id).await;
 
     state.client_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     info!("Client disconnected: {client_id} (total: {})",
@@ -462,6 +538,7 @@ fn handle_handshake(
 async fn handle_message<H: RequestHandler>(
     text: &str,
     handler: &Arc<H>,
+    context: RequestContext,
 ) -> String {
     let parsed: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -485,7 +562,7 @@ async fn handle_message<H: RequestHandler>(
     let params = parsed.get("params").cloned();
 
     // Route to handler
-    match handler.handle_request(method, params).await {
+    match handler.handle_request(method, params, context).await {
         Ok(result) => {
             let resp = ECPResponse::success(
                 id.unwrap_or(RequestId::Number(0)),
@@ -498,4 +575,28 @@ async fn handle_message<H: RequestHandler>(
             serde_json::to_string(&resp).unwrap()
         }
     }
+}
+
+/// Extract workspace ID from a successful workspace/open response.
+/// Returns (workspace_id, optional workspace notification receiver).
+fn extract_workspace_open_result<H: RequestHandler>(
+    response_json: &str,
+    handler: &Arc<H>,
+) -> Option<(String, Option<broadcast::Receiver<String>>)> {
+    let parsed: serde_json::Value = serde_json::from_str(response_json).ok()?;
+    // Only check successful responses that have a workspaceId in the result
+    let result = parsed.get("result")?;
+    let ws_id = result.get("workspaceId")?.as_str()?;
+    let rx = handler.workspace_notification_rx(ws_id);
+    Some((ws_id.to_string(), rx))
+}
+
+/// Check if the response is a successful workspace/close.
+fn is_workspace_close_success(response_json: &str) -> bool {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(response_json) {
+        if let Some(result) = parsed.get("result") {
+            return result.get("workspaceClosed").and_then(|v| v.as_bool()).unwrap_or(false);
+        }
+    }
+    false
 }

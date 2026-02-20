@@ -152,6 +152,10 @@ impl Service for SecretService {
         "secret"
     }
 
+    fn scope(&self) -> crate::ServiceScope {
+        crate::ServiceScope::Global
+    }
+
     async fn handle(&self, method: &str, params: Option<Value>) -> HandlerResult {
         match method {
             // TS wire format: { value: string | null }

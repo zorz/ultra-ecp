@@ -29,7 +29,7 @@ export class AgentSessionRegistry {
 
   constructor(
     private service: LocalAIService,
-    private getAgentConfig: (agentId: string) => IAgentConfig | undefined,
+    private getAgentConfig: (agentId: string) => IAgentConfig | undefined | Promise<IAgentConfig | undefined>,
     private workspaceRoot: string,
   ) {}
 
@@ -79,8 +79,8 @@ export class AgentSessionRegistry {
       return existing;
     }
 
-    // Create new session for this agent
-    const agentConfig = this.getAgentConfig(agentId);
+    // Create new session for this agent (resolver may be sync or async)
+    const agentConfig = await Promise.resolve(this.getAgentConfig(agentId));
     const { type: providerType, model: fallbackModel } = fallbackProvider;
 
     // Resolve provider and model from agent config

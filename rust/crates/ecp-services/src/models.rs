@@ -66,6 +66,10 @@ impl Service for ModelsService {
         "models"
     }
 
+    fn scope(&self) -> crate::ServiceScope {
+        crate::ServiceScope::Global
+    }
+
     async fn handle(&self, method: &str, params: Option<Value>) -> HandlerResult {
         match method {
             "models/list" => {

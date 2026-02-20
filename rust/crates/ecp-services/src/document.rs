@@ -357,6 +357,10 @@ impl Service for DocumentService {
         "document"
     }
 
+    fn scope(&self) -> crate::ServiceScope {
+        crate::ServiceScope::Global
+    }
+
     async fn handle(&self, method: &str, params: Option<serde_json::Value>) -> HandlerResult {
         let result = self.handle_inner(method, params).await?;
 

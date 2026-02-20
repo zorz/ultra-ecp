@@ -50,11 +50,13 @@ impl WatchService {
     }
 
     fn resolve_path(&self, path: &str) -> PathBuf {
-        let p = std::path::Path::new(path);
+        // Strip file:// prefix if present (clients may send file:// URIs)
+        let stripped = path.strip_prefix("file://").unwrap_or(path);
+        let p = std::path::Path::new(stripped);
         if p.is_absolute() {
             p.to_path_buf()
         } else {
-            self.workspace_root.join(path)
+            self.workspace_root.join(stripped)
         }
     }
 
@@ -72,7 +74,7 @@ impl WatchService {
             while let Some(event) = event_rx.recv().await {
                 if let Some(ref tx) = notify_tx {
                     for path in &event.paths {
-                        let uri = path.to_string_lossy().to_string();
+                        let uri = format!("file://{}", path.display());
                         // Match TypeScript ECP: didCreate/didDelete send { uri },
                         // didChange sends full event { uri, type, timestamp }
                         match event.kind {
