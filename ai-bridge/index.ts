@@ -226,6 +226,10 @@ async function initializeServices() {
       async removeSessionAgent(sessionId: string, agentId: string) {
         await callECPMethod("chat/sessionAgent/remove", { sessionId, agentId });
       },
+      async getCompactions(sessionId: string) {
+        const result = await callECPMethod("chat/compaction/list", { sessionId });
+        return Array.isArray(result) ? result : [];
+      },
     };
     aiAdapter.setChatStorage(bridgeChatStorage as any);
 

@@ -9,3 +9,6 @@ rust/target/
 # Generated docs
 docs/ts/
 docs/rust
+
+# Reference archive (not tracked)
+ecp-archive/

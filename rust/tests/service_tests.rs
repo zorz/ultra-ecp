@@ -1162,6 +1162,49 @@ mod chat {
     }
 
     #[tokio::test]
+    async fn compaction_apply() {
+        let (_tmp, s) = svc();
+        let sid = create_test_session(&s).await;
+
+        // Add 5 messages
+        let mut msg_ids = Vec::new();
+        for i in 0..5 {
+            let role = if i % 2 == 0 { "user" } else { "assistant" };
+            let result = s.handle("chat/message/add", Some(json!({
+                "sessionId": sid, "role": role, "content": format!("message {}", i),
+            }))).await.unwrap();
+            msg_ids.push(result["messageId"].as_str().unwrap().to_string());
+        }
+
+        // Create compaction for first 3 messages
+        let result = s.handle("chat/compaction/create", Some(json!({
+            "sessionId": sid,
+            "summary": "Summary of first 3 messages",
+            "startMessageId": msg_ids[0],
+            "endMessageId": msg_ids[2],
+            "messagesCompacted": 3,
+        }))).await.unwrap();
+        let cmp_id = result["compactionId"].as_str().unwrap().to_string();
+
+        // Apply compaction to first 3 message IDs
+        let result = s.handle("chat/compaction/apply", Some(json!({
+            "compactionId": cmp_id,
+            "messageIds": [&msg_ids[0], &msg_ids[1], &msg_ids[2]],
+        }))).await.unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(result["messagesUpdated"], 3);
+
+        // Verify: list active messages should return only 2
+        let messages = s.handle("chat/message/list", Some(json!({
+            "sessionId": sid,
+        }))).await.unwrap();
+        let msgs = messages.as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "message 3");
+        assert_eq!(msgs[1]["content"], "message 4");
+    }
+
+    #[tokio::test]
     async fn todo_replace() {
         let (_tmp, s) = svc();
         let sid = create_test_session(&s).await;

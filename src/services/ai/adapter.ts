@@ -39,7 +39,9 @@ import { loadAgents, updateAgentInConfig } from '../chat/config/agent-loader.ts'
 import type { LocalAgentService } from '../agents/local.ts';
 import type { AgentInstance, AgentDetail } from '../agents/types.ts';
 import { AgentSessionRegistry } from './agent-session-registry.ts';
-import type { ChatStorage } from '../chat/storage.ts';
+import type { ChatStorage, StoredChatMessage, StoredCompaction } from '../chat/storage.ts';
+import { ContextWindowService } from './context-window.ts';
+import { CompactionService } from './compaction.ts';
 import type { PersonaService } from '../chat/services/PersonaService.ts';
 import type { AgentService as ChatAgentService } from '../chat/services/AgentService.ts';
 
@@ -169,6 +171,10 @@ export class AIServiceAdapter {
   private getDefaultModel: (() => string) | null = null;
   /** ECP request function for recording tool calls to chat DB */
   private ecpRequest: ((method: string, params?: unknown) => Promise<unknown>) | null = null;
+  /** Context window service for session resume */
+  private contextWindowService: ContextWindowService | null = null;
+  /** Compaction service for context management */
+  private compactionService: CompactionService | null = null;
 
   constructor(service: LocalAIService, workspaceRoot?: string) {
     this.service = service;
@@ -263,6 +269,12 @@ export class AIServiceAdapter {
       this.agentSessionRegistry.setWorkspacePathResolver(this.workspacePathResolver);
     }
 
+    // Initialize context window + compaction services for session resume
+    this.contextWindowService = new ContextWindowService();
+    if (this.ecpRequest) {
+      this.compactionService = new CompactionService(this.service, this.ecpRequest);
+    }
+
     debugLog('[AIServiceAdapter] ChatStorage set, AgentSessionRegistry initialized');
   }
 
@@ -297,6 +309,10 @@ export class AIServiceAdapter {
   setECPRequest(fn: (method: string, params?: unknown) => Promise<unknown>): void {
     this.ecpRequest = fn;
     this.service.setEcpRequest(fn);
+    // Initialize compaction service if not already done
+    if (!this.compactionService) {
+      this.compactionService = new CompactionService(this.service, fn);
+    }
     debugLog('[AIServiceAdapter] ECP request function set');
   }
 
@@ -618,6 +634,12 @@ export class AIServiceAdapter {
         return this.handleDeletePersona(params);
       case 'ai/persona/compress':
         return this.handleCompressPersona(params);
+
+      // Session resume + compaction
+      case 'ai/session/resume':
+        return this.handleResumeSession(params);
+      case 'ai/context/compact':
+        return this.handleManualCompact(params);
 
       default:
         return {
@@ -2153,6 +2175,227 @@ export class AIServiceAdapter {
     this.sendNotification('ai/persona/deleted', { id: p.id });
 
     return { result: { success: true } };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Session Resume + Compaction Handlers
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Resume an AI session from a stored chat session.
+   *
+   * Loads messages + compactions from the chat DB, builds curated context
+   * via ContextWindowService, auto-compacts if needed, then creates a new
+   * AI session with the curated message history.
+   */
+  private async handleResumeSession(params: unknown): Promise<HandlerResult> {
+    const p = params as {
+      chatSessionId?: string;
+      provider?: string;
+      model?: string;
+    };
+
+    if (!p?.chatSessionId) {
+      return { error: { code: AIErrorCodes.InvalidRequest, message: 'chatSessionId is required' } };
+    }
+
+    if (!this.ecpRequest) {
+      return { error: { code: AIErrorCodes.InternalError, message: 'ECP request function not configured' } };
+    }
+
+    if (!this.contextWindowService) {
+      return { error: { code: AIErrorCodes.InternalError, message: 'ContextWindowService not initialized' } };
+    }
+
+    try {
+      // 1. Load chat session metadata
+      const sessionData = await this.ecpRequest('chat/session/get', { id: p.chatSessionId }) as {
+        session?: {
+          id: string;
+          provider?: string;
+          model?: string;
+          systemPrompt?: string;
+          title?: string;
+        };
+      } | null;
+
+      const chatSession = sessionData?.session;
+      if (!chatSession) {
+        return { error: { code: AIErrorCodes.SessionNotFound, message: `Chat session not found: ${p.chatSessionId}` } };
+      }
+
+      // 2. Resolve provider/model (client override > session original > defaults)
+      const provider = (p.provider ?? chatSession.provider ?? 'claude') as AIProviderType;
+      const model = p.model ?? chatSession.model ?? this.getDefaultModel?.() ?? undefined;
+      const systemPrompt = chatSession.systemPrompt ?? '';
+
+      // 3. Load active messages
+      const messagesResult = await this.ecpRequest('chat/message/list', {
+        sessionId: p.chatSessionId,
+        limit: 1000,
+      });
+      const activeMessages: StoredChatMessage[] = Array.isArray(messagesResult)
+        ? messagesResult as StoredChatMessage[]
+        : [];
+
+      // 4. Load compactions
+      const compactionsResult = await this.ecpRequest('chat/compaction/list', {
+        sessionId: p.chatSessionId,
+      });
+      let compactions: StoredCompaction[] = Array.isArray(compactionsResult)
+        ? compactionsResult as StoredCompaction[]
+        : [];
+
+      // 5. Determine context window from provider capabilities
+      const capabilities = this.service.getProviderCapabilities(provider);
+      const contextWindow = capabilities?.maxContextTokens ?? 200000;
+
+      // 6. Build curated context
+      let context = this.contextWindowService.buildContext({
+        systemPrompt,
+        activeMessages,
+        compactions,
+        contextWindow,
+      });
+
+      // 7. Auto-compact if needed and enough messages
+      let autoCompacted = false;
+      if (context.exceedsWindow && activeMessages.length > 15 && this.compactionService) {
+        try {
+          await this.compactionService.compact({
+            sessionId: p.chatSessionId,
+            messages: activeMessages,
+            keepRecentCount: 10,
+          });
+          autoCompacted = true;
+
+          // Reload messages + compactions after compaction
+          const reloadedMessages = await this.ecpRequest('chat/message/list', {
+            sessionId: p.chatSessionId,
+            limit: 1000,
+          });
+          const reloadedCompactions = await this.ecpRequest('chat/compaction/list', {
+            sessionId: p.chatSessionId,
+          });
+
+          const newMessages: StoredChatMessage[] = Array.isArray(reloadedMessages)
+            ? reloadedMessages as StoredChatMessage[]
+            : [];
+          compactions = Array.isArray(reloadedCompactions)
+            ? reloadedCompactions as StoredCompaction[]
+            : [];
+
+          // Rebuild context
+          context = this.contextWindowService.buildContext({
+            systemPrompt,
+            activeMessages: newMessages,
+            compactions,
+            contextWindow,
+          });
+        } catch (compactError) {
+          debugLog(`[AIServiceAdapter] Auto-compaction failed: ${compactError}`);
+          // Continue with uncompacted context
+        }
+      }
+
+      // 8. Create AI session with curated messages
+      const providerNames: Record<string, string> = {
+        claude: 'Claude',
+        openai: 'OpenAI',
+        gemini: 'Gemini',
+        ollama: 'Ollama',
+        'agent-sdk': 'Claude (Agent SDK)',
+      };
+
+      const sessionOptions: CreateSessionOptions = {
+        provider: {
+          type: provider,
+          name: providerNames[provider] || provider,
+          model,
+        },
+        systemPrompt,
+        messages: context.messages,
+        cwd: this.getWorkspacePath(),
+      };
+
+      const session = await this.service.createSession(sessionOptions);
+
+      return {
+        result: {
+          aiSessionId: session.id,
+          provider,
+          model: model ?? session.provider.model,
+          contextTokens: context.totalTokens,
+          contextWindow,
+          messagesLoaded: context.messagesLoaded,
+          compactionsApplied: context.compactionsApplied,
+          autoCompacted,
+        },
+      };
+    } catch (error) {
+      return {
+        error: {
+          code: AIErrorCodes.InternalError,
+          message: error instanceof Error ? parseProviderError(error.message) : 'Failed to resume session',
+        },
+      };
+    }
+  }
+
+  /**
+   * Manual compaction — compact older messages in a chat session.
+   */
+  private async handleManualCompact(params: unknown): Promise<HandlerResult> {
+    const p = params as {
+      chatSessionId?: string;
+      keepRecentCount?: number;
+    };
+
+    if (!p?.chatSessionId) {
+      return { error: { code: AIErrorCodes.InvalidRequest, message: 'chatSessionId is required' } };
+    }
+
+    if (!this.compactionService) {
+      return { error: { code: AIErrorCodes.InternalError, message: 'CompactionService not initialized' } };
+    }
+
+    if (!this.ecpRequest) {
+      return { error: { code: AIErrorCodes.InternalError, message: 'ECP request function not configured' } };
+    }
+
+    try {
+      // Load active messages
+      const messagesResult = await this.ecpRequest('chat/message/list', {
+        sessionId: p.chatSessionId,
+        limit: 1000,
+      });
+      const messages: StoredChatMessage[] = Array.isArray(messagesResult)
+        ? messagesResult as StoredChatMessage[]
+        : [];
+
+      const result = await this.compactionService.compact({
+        sessionId: p.chatSessionId,
+        messages,
+        keepRecentCount: p.keepRecentCount,
+      });
+
+      return {
+        result: {
+          compactionId: result.compactionId,
+          summary: result.summary,
+          messagesCompacted: result.messagesCompacted,
+          originalTokenCount: result.originalTokenCount,
+          compressedTokenCount: result.compressedTokenCount,
+        },
+      };
+    } catch (error) {
+      return {
+        error: {
+          code: AIErrorCodes.InternalError,
+          message: error instanceof Error ? error.message : 'Failed to compact session',
+        },
+      };
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────

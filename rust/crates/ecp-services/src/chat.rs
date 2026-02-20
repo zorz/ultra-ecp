@@ -1248,6 +1248,19 @@ impl ChatDb {
         Ok(changed > 0)
     }
 
+    fn apply_compaction(&self, _compaction_id: &str, message_ids: &[String]) -> Result<usize, rusqlite::Error> {
+        // Note: compacted_into_id has a FK to messages(id) so we can't store the compaction ID there.
+        // The compaction record's start/end message IDs track the range instead.
+        let mut total = 0usize;
+        for msg_id in message_ids {
+            total += self.conn.execute(
+                "UPDATE messages SET is_active = 0 WHERE id = ?1",
+                rusqlite::params![msg_id],
+            )?;
+        }
+        Ok(total)
+    }
+
     fn get_compaction(&self, id: &str) -> Result<Option<Value>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, summary, start_message_id, end_message_id,
@@ -2656,6 +2669,11 @@ impl Service for ChatService {
                 }).await?;
                 Ok(json!({ "success": updated }))
             }
+            "chat/compaction/apply" => {
+                let p: CompactionApplyParams = parse_params(params)?;
+                let updated = self.with_db(move |db| db.apply_compaction(&p.compaction_id, &p.message_ids)).await?;
+                Ok(json!({ "success": true, "messagesUpdated": updated }))
+            }
 
             // ── Documents ────────────────────────────────────────────
             "chat/document/create" => {
@@ -3342,6 +3360,14 @@ struct CompactionCreateParams {
     original_token_count: Option<i64>,
     #[serde(rename = "compressedTokenCount")]
     compressed_token_count: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CompactionApplyParams {
+    #[serde(rename = "compactionId")]
+    compaction_id: String,
+    #[serde(rename = "messageIds")]
+    message_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
