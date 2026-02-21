@@ -83,6 +83,17 @@ export class AgentSDKProvider extends BaseAIProvider {
   /** Local pending permissions for canUseTool callback */
   private pendingPermissions: Map<string, AgentSDKPendingEntry> = new Map();
 
+  /** Active sub-agents keyed by parent_tool_use_id (the Task tool_use.id) */
+  private activeSubAgents: Map<string, {
+    toolUseId: string;
+    subagentType: string;
+    description: string;
+    startedAt: number;
+  }> = new Map();
+
+  /** Track which agent is currently producing messages (null = main agent) */
+  private currentAgentToolUseId: string | null = null;
+
   /** Callback to register permissions with LocalAIService */
   private registerPermission?: PermissionRegistryFn;
 
@@ -372,6 +383,10 @@ export class AgentSDKProvider extends BaseAIProvider {
                   this.pendingPermissions.delete(options.toolUseID);
                   if (approved) {
                     debugLog(`[AgentSDK] Approved ${toolName} (${options.toolUseID}), resolving SDK promise`);
+                    // Resolve agent attribution for approval event
+                    const approvalAgent = this.currentAgentToolUseId
+                      ? this.activeSubAgents.get(this.currentAgentToolUseId)
+                      : null;
                     // Emit tool_use_started to convert the permission card → execution spinner
                     onEvent({
                       type: 'tool_use_started',
@@ -379,6 +394,11 @@ export class AgentSDKProvider extends BaseAIProvider {
                       toolName,
                       input: input as Record<string, unknown>,
                       autoApproved: false,
+                      ...(approvalAgent && {
+                        agentId: approvalAgent.toolUseId,
+                        agentName: approvalAgent.description || approvalAgent.subagentType,
+                        agentRole: 'specialist' as const,
+                      }),
                     } as StreamEvent);
 
                     if (toolName === 'AskUserQuestion' && answers) {
@@ -400,6 +420,11 @@ export class AgentSDKProvider extends BaseAIProvider {
               debugLog(`[AgentSDK] WARNING: registerPermission not set, canUseTool will hang for ${toolName}`);
             }
 
+            // Resolve agent attribution from current stream context
+            const permAgent = this.currentAgentToolUseId
+              ? this.activeSubAgents.get(this.currentAgentToolUseId)
+              : null;
+
             // Emit permission request event to GUI
             onEvent({
               type: 'tool_use_request',
@@ -408,6 +433,11 @@ export class AgentSDKProvider extends BaseAIProvider {
               input: input as Record<string, unknown>,
               description: options.decisionReason || `Use ${toolName}`,
               requiresApproval: true,
+              ...(permAgent && {
+                agentId: permAgent.toolUseId,
+                agentName: permAgent.description || permAgent.subagentType,
+                agentRole: 'specialist' as const,
+              }),
             } as StreamEvent);
           });
         },
@@ -457,9 +487,42 @@ export class AgentSDKProvider extends BaseAIProvider {
           };
           if (!betaMsg?.content) break;
 
+          // Track which agent produced this assistant message
+          const parentId = msg.parent_tool_use_id as string | null;
+          this.currentAgentToolUseId = parentId || null;
+
           for (const block of betaMsg.content) {
             if (block.type === 'tool_use') {
               const toolName = block.name as string;
+
+              // Detect sub-agent spawn via Task tool
+              if (toolName === 'Task') {
+                const input = block.input as { subagent_type?: string; description?: string; prompt?: string } | undefined;
+                const subagentType = input?.subagent_type || 'unknown';
+                const description = input?.description || subagentType;
+                this.activeSubAgents.set(block.id as string, {
+                  toolUseId: block.id as string,
+                  subagentType,
+                  description,
+                  startedAt: Date.now(),
+                });
+                onEvent({
+                  type: 'agent_joined',
+                  agentId: block.id as string,
+                  agentName: description,
+                  agentRole: 'specialist',
+                } as StreamEvent);
+                onEvent({
+                  type: 'agent_status',
+                  agentId: block.id as string,
+                  agentName: description,
+                  agentRole: 'specialist',
+                  status: 'executing',
+                } as StreamEvent);
+              }
+
+              // Resolve agent attribution for tool events
+              const agent = parentId ? this.activeSubAgents.get(parentId) : null;
 
               // Only emit tool_use_started for auto-approved tools.
               // Non-auto-approved tools go through canUseTool → tool_use_request,
@@ -471,6 +534,11 @@ export class AgentSDKProvider extends BaseAIProvider {
                   toolName,
                   input: block.input,
                   autoApproved: true,
+                  ...(agent && {
+                    agentId: agent.toolUseId,
+                    agentName: agent.description || agent.subagentType,
+                    agentRole: 'specialist' as const,
+                  }),
                 } as StreamEvent);
 
                 // Bridge TodoWrite to ECP — emit synthetic todo_update
@@ -504,15 +572,45 @@ export class AgentSDKProvider extends BaseAIProvider {
             Record<string, unknown>
           >) {
             if (block.type === 'tool_result') {
+              const toolUseId = block.tool_use_id as string;
+
+              // Resolve agent attribution for this tool result
+              const parentId = msg.parent_tool_use_id as string | null;
+              const agent = parentId ? this.activeSubAgents.get(parentId) : null;
+
               onEvent({
                 type: 'tool_use_result',
-                toolUseId: block.tool_use_id,
+                toolUseId,
                 success: !block.is_error,
                 result:
                   typeof block.content === 'string'
                     ? block.content
                     : JSON.stringify(block.content),
+                ...(agent && {
+                  agentId: agent.toolUseId,
+                  agentName: agent.description || agent.subagentType,
+                  agentRole: 'specialist' as const,
+                }),
               } as StreamEvent);
+
+              // Detect sub-agent completion (tool_result for a Task tool_use)
+              const completedAgent = this.activeSubAgents.get(toolUseId);
+              if (completedAgent) {
+                onEvent({
+                  type: 'agent_status',
+                  agentId: completedAgent.toolUseId,
+                  agentName: completedAgent.description || completedAgent.subagentType,
+                  agentRole: 'specialist',
+                  status: 'idle',
+                  previousStatus: 'executing',
+                } as StreamEvent);
+                onEvent({
+                  type: 'agent_left',
+                  agentId: completedAgent.toolUseId,
+                  agentName: completedAgent.description || completedAgent.subagentType,
+                } as StreamEvent);
+                this.activeSubAgents.delete(toolUseId);
+              }
             }
           }
           break;
@@ -524,12 +622,22 @@ export class AgentSDKProvider extends BaseAIProvider {
           const evt = msg.event as Record<string, unknown>;
           if (!evt) break;
 
+          // Track which agent is producing this stream
+          const streamParentId = msg.parent_tool_use_id as string | null;
+          this.currentAgentToolUseId = streamParentId || null;
+          const streamAgent = streamParentId ? this.activeSubAgents.get(streamParentId) : null;
+
           if (evt.type === 'content_block_delta') {
             const delta = evt.delta as Record<string, unknown>;
             if (delta?.type === 'text_delta' && delta.text) {
               onEvent({
                 type: 'content_block_delta',
                 delta: { type: 'text_delta', text: delta.text },
+                ...(streamAgent && {
+                  agentId: streamAgent.toolUseId,
+                  agentName: streamAgent.description || streamAgent.subagentType,
+                  agentRole: 'specialist' as const,
+                }),
               } as StreamEvent);
               // Don't accumulate here — fullText comes from 'assistant' messages
             }
@@ -587,6 +695,18 @@ export class AgentSDKProvider extends BaseAIProvider {
     }
 
     this.activeQuery = null;
+
+    // Defensive cleanup: emit agent_left for any sub-agents still tracked
+    for (const [id, agent] of this.activeSubAgents) {
+      onEvent({
+        type: 'agent_left',
+        agentId: agent.toolUseId,
+        agentName: agent.description || agent.subagentType,
+      } as StreamEvent);
+    }
+    this.activeSubAgents.clear();
+    this.currentAgentToolUseId = null;
+
     onEvent({ type: 'message_stop' } as StreamEvent);
 
     return {
@@ -632,6 +752,10 @@ export class AgentSDKProvider extends BaseAIProvider {
       entry.canUseResolve({ behavior: 'deny', message: 'Stream cancelled' });
     }
     this.pendingPermissions.clear();
+
+    // Clean up sub-agent tracking (no onEvent available here)
+    this.activeSubAgents.clear();
+    this.currentAgentToolUseId = null;
 
     this.activeQuery?.close();
     this.activeQuery = null;
