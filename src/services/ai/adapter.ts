@@ -949,6 +949,27 @@ export class AIServiceAdapter {
           });
         }
 
+        // Persist iteration events to chat DB for stats tracking
+        if (evt.type === 'iteration_start' && this.ecpRequest && p.storageSessionId) {
+          const iterEvt = evt as unknown as { iteration: number };
+          this.ecpRequest('chat/iteration/start', {
+            sessionId: p.storageSessionId,
+            iterationId: iterEvt.iteration,
+          }).catch((err) => {
+            debugLog(`[AIServiceAdapter] Failed to record iteration start: ${err}`);
+          });
+        }
+        if (evt.type === 'iteration_complete' && this.ecpRequest && p.storageSessionId) {
+          const iterEvt = evt as unknown as { iteration: number; hasToolUse: boolean };
+          this.ecpRequest('chat/iteration/complete', {
+            sessionId: p.storageSessionId,
+            iterationId: iterEvt.iteration,
+            hasToolUse: iterEvt.hasToolUse,
+          }).catch((err) => {
+            debugLog(`[AIServiceAdapter] Failed to record iteration complete: ${err}`);
+          });
+        }
+
         // Bridge Agent SDK TodoWrite to chat DB via ECP todo system
         if (evt.type === 'todo_update' && Array.isArray(evt.todos)) {
           const sessionId = p.storageSessionId || null;

@@ -1264,6 +1264,181 @@ mod chat {
         assert_eq!(todos[1]["content"], "new task 2");
         assert_eq!(todos[1]["status"], "in_progress");
     }
+
+    #[tokio::test]
+    async fn session_stats_full() {
+        let (_tmp, s) = svc();
+
+        // Create session
+        let sess = s.handle("chat/session/create", Some(json!({
+            "title": "Stats Test",
+        }))).await.unwrap();
+        let sid = sess["id"].as_str().unwrap().to_string();
+
+        // Add tool calls with file paths
+        s.handle("chat/toolCall/add", Some(json!({
+            "id": "tc-1", "sessionId": &sid, "toolName": "Read",
+            "input": { "file_path": "/src/main.rs" },
+        }))).await.unwrap();
+        s.handle("chat/toolCall/add", Some(json!({
+            "id": "tc-2", "sessionId": &sid, "toolName": "Edit",
+            "input": { "file_path": "/src/main.rs" },
+        }))).await.unwrap();
+        s.handle("chat/toolCall/add", Some(json!({
+            "id": "tc-3", "sessionId": &sid, "toolName": "Write",
+            "input": { "file_path": "/src/lib.rs" },
+        }))).await.unwrap();
+        s.handle("chat/toolCall/add", Some(json!({
+            "id": "tc-4", "sessionId": &sid, "toolName": "Grep",
+            "input": { "path": "/src/utils.rs" },
+        }))).await.unwrap();
+
+        // Complete them
+        s.handle("chat/toolCall/complete", Some(json!({
+            "id": "tc-1", "status": "success",
+        }))).await.unwrap();
+        s.handle("chat/toolCall/complete", Some(json!({
+            "id": "tc-2", "status": "success",
+        }))).await.unwrap();
+        s.handle("chat/toolCall/complete", Some(json!({
+            "id": "tc-3", "status": "error", "errorMessage": "disk full",
+        }))).await.unwrap();
+        s.handle("chat/toolCall/complete", Some(json!({
+            "id": "tc-4", "status": "success",
+        }))).await.unwrap();
+
+        // Add iterations
+        s.handle("chat/iteration/start", Some(json!({
+            "sessionId": &sid, "iterationId": 1,
+        }))).await.unwrap();
+        s.handle("chat/iteration/complete", Some(json!({
+            "sessionId": &sid, "iterationId": 1, "hasToolUse": true, "toolCount": 3,
+        }))).await.unwrap();
+        s.handle("chat/iteration/start", Some(json!({
+            "sessionId": &sid, "iterationId": 2,
+        }))).await.unwrap();
+        s.handle("chat/iteration/complete", Some(json!({
+            "sessionId": &sid, "iterationId": 2, "hasToolUse": false,
+        }))).await.unwrap();
+
+        // Fetch session stats
+        let stats = s.handle("chat/stats/session", Some(json!({
+            "sessionId": &sid,
+        }))).await.unwrap();
+
+        // Pulse
+        assert_eq!(stats["pulse"]["totalOps"], 4);
+        assert_eq!(stats["pulse"]["errorCount"], 1);
+        assert!(stats["pulse"]["errorRate"].as_f64().unwrap() > 0.0);
+        assert_eq!(stats["pulse"]["uniqueFileCount"], 3);
+
+        // File activity
+        let file_activity = stats["fileActivity"].as_array().unwrap();
+        assert!(!file_activity.is_empty());
+        // main.rs should be first (2 ops)
+        assert_eq!(file_activity[0]["filePath"], "/src/main.rs");
+        assert_eq!(file_activity[0]["totalOps"], 2);
+        assert_eq!(file_activity[0]["readCount"], 1);
+        assert_eq!(file_activity[0]["editCount"], 1);
+
+        // Tool breakdown
+        let breakdown = stats["toolBreakdown"].as_array().unwrap();
+        assert!(!breakdown.is_empty());
+
+        // Iteration depth
+        assert_eq!(stats["iterationDepth"]["totalIterations"], 2);
+        assert_eq!(stats["iterationDepth"]["withToolsCount"], 1);
+        assert_eq!(stats["iterationDepth"]["thinkOnlyCount"], 1);
+        assert!(stats["iterationDepth"]["toolsPerIteration"].as_f64().unwrap() > 0.0);
+        let durations = stats["iterationDepth"]["iterationDurationsMs"].as_array().unwrap();
+        assert_eq!(durations.len(), 2);
+
+        // Health scores in 0-100
+        let health = &stats["health"];
+        assert!(health["focusScore"].as_f64().unwrap() >= 0.0);
+        assert!(health["focusScore"].as_f64().unwrap() <= 100.0);
+        assert!(health["efficiencyScore"].as_f64().unwrap() >= 0.0);
+        assert!(health["overallScore"].as_f64().unwrap() >= 0.0);
+        assert!(health["level"].as_str().is_some());
+
+        // Scope drift
+        assert!(stats["scopeDrift"]["driftRatio"].as_f64().is_some());
+
+        // Execution speed
+        assert!(stats["executionSpeed"]["speedSparkline"].as_array().unwrap().len() == 10);
+
+        // File dependencies
+        assert!(stats["fileDependencies"]["editChain"].as_array().is_some());
+        assert!(stats["fileDependencies"]["coTouchedFiles"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    async fn iteration_crud() {
+        let (_tmp, s) = svc();
+
+        let sess = s.handle("chat/session/create", Some(json!({
+            "title": "Iter Test",
+        }))).await.unwrap();
+        let sid = sess["id"].as_str().unwrap().to_string();
+
+        // Start iteration
+        s.handle("chat/iteration/start", Some(json!({
+            "sessionId": &sid, "iterationId": 1,
+        }))).await.unwrap();
+
+        // Complete with tool use
+        s.handle("chat/iteration/complete", Some(json!({
+            "sessionId": &sid, "iterationId": 1, "hasToolUse": true, "toolCount": 5,
+        }))).await.unwrap();
+
+        // Start another
+        s.handle("chat/iteration/start", Some(json!({
+            "sessionId": &sid, "iterationId": 2,
+        }))).await.unwrap();
+        s.handle("chat/iteration/complete", Some(json!({
+            "sessionId": &sid, "iterationId": 2, "hasToolUse": false,
+        }))).await.unwrap();
+
+        // Fetch stats and verify iteration depth
+        let stats = s.handle("chat/stats/session", Some(json!({
+            "sessionId": &sid,
+        }))).await.unwrap();
+
+        assert_eq!(stats["iterationDepth"]["totalIterations"], 2);
+        assert_eq!(stats["iterationDepth"]["currentIteration"], 2);
+        assert_eq!(stats["iterationDepth"]["withToolsCount"], 1);
+        assert_eq!(stats["iterationDepth"]["thinkOnlyCount"], 1);
+        assert!(stats["iterationDepth"]["toolsPerIteration"].as_f64().unwrap() > 0.0);
+
+        // Verify session iteration_count was updated
+        let session = s.handle("chat/session/get", Some(json!({
+            "sessionId": &sid,
+        }))).await.unwrap();
+        assert_eq!(session["session"]["iterationCount"], 2);
+    }
+
+    #[tokio::test]
+    async fn session_stats_empty_session() {
+        let (_tmp, s) = svc();
+
+        let sess = s.handle("chat/session/create", Some(json!({
+            "title": "Empty Stats",
+        }))).await.unwrap();
+        let sid = sess["id"].as_str().unwrap().to_string();
+
+        let stats = s.handle("chat/stats/session", Some(json!({
+            "sessionId": &sid,
+        }))).await.unwrap();
+
+        assert_eq!(stats["pulse"]["totalOps"], 0);
+        assert_eq!(stats["pulse"]["errorCount"], 0);
+        assert_eq!(stats["pulse"]["errorRate"], 0.0);
+        assert_eq!(stats["pulse"]["uniqueFileCount"], 0);
+        assert!(stats["fileActivity"].as_array().unwrap().is_empty());
+        assert!(stats["toolBreakdown"].as_array().unwrap().is_empty());
+        assert_eq!(stats["iterationDepth"]["totalIterations"], 0);
+        assert_eq!(stats["health"]["level"], "good");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

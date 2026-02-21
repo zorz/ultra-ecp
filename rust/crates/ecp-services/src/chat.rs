@@ -580,6 +580,23 @@ CREATE TABLE IF NOT EXISTS agent_state (
 CREATE INDEX IF NOT EXISTS idx_agent_state_status ON agent_state(status);
 
 -- ============================================================================
+-- Iterations (stats tracking)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS iterations (
+    id INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    has_tool_use INTEGER DEFAULT 0,
+    tool_count INTEGER DEFAULT 0,
+    PRIMARY KEY (session_id, id),
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_iterations_session ON iterations(session_id);
+
+-- ============================================================================
 -- Schema version tracking
 -- ============================================================================
 
@@ -1776,6 +1793,418 @@ impl ChatDb {
         }
     }
 
+    // ── Iterations ──────────────────────────────────────────────────────
+
+    fn start_iteration(&self, session_id: &str, iteration_id: i64) -> Result<(), rusqlite::Error> {
+        let now = now_ms() as i64;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO iterations (id, session_id, started_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![iteration_id, session_id, now],
+        )?;
+        self.conn.execute(
+            "UPDATE sessions SET iteration_count = MAX(COALESCE(iteration_count, 0), ?1), updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![iteration_id, now, session_id],
+        )?;
+        Ok(())
+    }
+
+    fn complete_iteration(&self, session_id: &str, iteration_id: i64, has_tool_use: bool, tool_count: i64) -> Result<(), rusqlite::Error> {
+        let now = now_ms() as i64;
+        self.conn.execute(
+            "UPDATE iterations SET completed_at = ?1, has_tool_use = ?2, tool_count = ?3 WHERE session_id = ?4 AND id = ?5",
+            rusqlite::params![now, has_tool_use as i32, tool_count, session_id, iteration_id],
+        )?;
+        Ok(())
+    }
+
+    fn list_iterations(&self, session_id: &str) -> Result<Vec<Value>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, started_at, completed_at, has_tool_use, tool_count
+             FROM iterations WHERE session_id = ?1 ORDER BY id ASC"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "sessionId": row.get::<_, String>(1)?,
+                "startedAt": row.get::<_, i64>(2)?,
+                "completedAt": row.get::<_, Option<i64>>(3)?,
+                "hasToolUse": row.get::<_, Option<i32>>(4)?.unwrap_or(0) != 0,
+                "toolCount": row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+            }))
+        })?;
+        rows.collect()
+    }
+
+    // ── Session Stats ──────────────────────────────────────────────────
+
+    fn session_stats(&self, session_id: &str) -> Result<Value, rusqlite::Error> {
+        use std::collections::{HashMap, HashSet};
+
+        // ── 1. Fetch all tool calls for this session (ordered by started_at) ──
+        let mut stmt = self.conn.prepare(
+            "SELECT id, tool_name, status, input, started_at, completed_at
+             FROM tool_calls WHERE session_id = ?1 ORDER BY started_at ASC"
+        )?;
+        struct ToolCallRow {
+            id: String,
+            tool_name: String,
+            status: String,
+            input: Option<String>,
+            started_at: Option<i64>,
+            completed_at: Option<i64>,
+        }
+        let tool_calls: Vec<ToolCallRow> = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok(ToolCallRow {
+                id: row.get(0)?,
+                tool_name: row.get(1)?,
+                status: row.get(2)?,
+                input: row.get(3)?,
+                started_at: row.get(4)?,
+                completed_at: row.get(5)?,
+            })
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        let total_ops = tool_calls.len() as i64;
+
+        // Extract file_path from input JSON
+        fn extract_file_path(input: &Option<String>) -> Option<String> {
+            let s = input.as_ref()?;
+            let v: Value = serde_json::from_str(s).ok()?;
+            v.get("file_path").and_then(|p| p.as_str().map(String::from))
+                .or_else(|| v.get("path").and_then(|p| p.as_str().map(String::from)))
+        }
+
+        fn extract_parent_dir(path: &str) -> &str {
+            match path.rfind('/') {
+                Some(pos) if pos > 0 => &path[..pos],
+                _ => path,
+            }
+        }
+
+        fn classify_tool(name: &str) -> &'static str {
+            match name {
+                n if n.contains("Read") || n.contains("Glob") || n.contains("Grep") || n == "LS" || n.contains("Search") => "read",
+                n if n.contains("Write") => "write",
+                n if n.contains("Edit") => "edit",
+                _ => "other",
+            }
+        }
+
+        // ── 2. Pulse ──
+        let error_count = tool_calls.iter().filter(|tc| tc.status == "error").count() as i64;
+        let error_rate = if total_ops > 0 { error_count as f64 / total_ops as f64 } else { 0.0 };
+
+        let mut unique_files: HashSet<String> = HashSet::new();
+        for tc in &tool_calls {
+            if let Some(fp) = extract_file_path(&tc.input) {
+                unique_files.insert(fp);
+            }
+        }
+
+        let first_started = tool_calls.iter().filter_map(|tc| tc.started_at).min().unwrap_or(0);
+        let last_started = tool_calls.iter().filter_map(|tc| tc.started_at).max().unwrap_or(0);
+        let session_duration_ms = if first_started > 0 { last_started - first_started } else { 0 };
+
+        let active_tool = tool_calls.iter().rev()
+            .find(|tc| tc.completed_at.is_none() && tc.started_at.is_some())
+            .map(|tc| tc.tool_name.clone());
+
+        // ── 3. Tool Breakdown ──
+        let mut tool_breakdown: HashMap<String, (i64, i64)> = HashMap::new();
+        for tc in &tool_calls {
+            let entry = tool_breakdown.entry(tc.tool_name.clone()).or_insert((0, 0));
+            entry.0 += 1;
+            if tc.status == "error" { entry.1 += 1; }
+        }
+        let mut tool_breakdown_vec: Vec<Value> = tool_breakdown.iter()
+            .map(|(name, (count, errs))| json!({ "toolName": name, "count": count, "errorCount": errs }))
+            .collect();
+        tool_breakdown_vec.sort_by(|a, b| b["count"].as_i64().cmp(&a["count"].as_i64()));
+
+        // ── 4. File Activity ──
+        struct FileStats {
+            read_count: i64,
+            write_count: i64,
+            edit_count: i64,
+            total_ops: i64,
+            first_seen: i64,
+            last_seen: i64,
+        }
+        let mut file_activity_map: HashMap<String, FileStats> = HashMap::new();
+
+        // Also track (file_path, started_at, tool_class) for churn and dependencies
+        struct FileOp {
+            file_path: String,
+            started_at: i64,
+            tool_name: String,
+            tool_class: &'static str,
+        }
+        let mut file_ops: Vec<FileOp> = Vec::new();
+
+        for tc in &tool_calls {
+            if let Some(fp) = extract_file_path(&tc.input) {
+                let ts = tc.started_at.unwrap_or(0);
+                let class = classify_tool(&tc.tool_name);
+
+                let entry = file_activity_map.entry(fp.clone()).or_insert(FileStats {
+                    read_count: 0, write_count: 0, edit_count: 0,
+                    total_ops: 0, first_seen: ts, last_seen: ts,
+                });
+                match class {
+                    "read" => entry.read_count += 1,
+                    "write" => entry.write_count += 1,
+                    "edit" => entry.edit_count += 1,
+                    _ => {}
+                }
+                entry.total_ops += 1;
+                if ts < entry.first_seen { entry.first_seen = ts; }
+                if ts > entry.last_seen { entry.last_seen = ts; }
+
+                file_ops.push(FileOp { file_path: fp, started_at: ts, tool_name: tc.tool_name.clone(), tool_class: class });
+            }
+        }
+
+        let mut file_activity_vec: Vec<(&String, &FileStats)> = file_activity_map.iter().collect();
+        file_activity_vec.sort_by(|a, b| b.1.total_ops.cmp(&a.1.total_ops));
+        let file_activity: Vec<Value> = file_activity_vec.iter().take(50).map(|(path, stats)| {
+            json!({
+                "filePath": path,
+                "readCount": stats.read_count,
+                "writeCount": stats.write_count,
+                "editCount": stats.edit_count,
+                "totalOps": stats.total_ops,
+                "firstSeenMs": stats.first_seen,
+                "lastSeenMs": stats.last_seen,
+            })
+        }).collect();
+
+        // ── 5. Churn Alerts ──
+        // Files with ≥3 edit/write ops in any 60s window
+        let mut churn_alerts: Vec<Value> = Vec::new();
+        {
+            let mut edits_by_file: HashMap<&str, Vec<i64>> = HashMap::new();
+            for op in &file_ops {
+                if op.tool_class == "edit" || op.tool_class == "write" {
+                    edits_by_file.entry(&op.file_path).or_default().push(op.started_at);
+                }
+            }
+            for (file_path, timestamps) in &edits_by_file {
+                // Sliding window: check if any 60s window has ≥3 ops
+                let window_ms: i64 = 60_000;
+                let mut max_in_window = 0i64;
+                for (i, &t) in timestamps.iter().enumerate() {
+                    let count = timestamps[i..].iter().take_while(|&&t2| t2 - t <= window_ms).count() as i64;
+                    if count > max_in_window { max_in_window = count; }
+                }
+                if max_in_window >= 3 {
+                    churn_alerts.push(json!({
+                        "filePath": file_path,
+                        "editCount": max_in_window,
+                        "windowSeconds": 60,
+                    }));
+                }
+            }
+        }
+
+        // ── 6. Scope Drift ──
+        let mut dir_counts: HashMap<String, i64> = HashMap::new();
+        let mut initial_dirs: HashSet<String> = HashSet::new();
+        let mut drift_dirs: HashSet<String> = HashSet::new();
+        let mut all_dirs: HashSet<String> = HashSet::new();
+
+        for (i, op) in file_ops.iter().enumerate() {
+            let dir = extract_parent_dir(&op.file_path).to_string();
+            *dir_counts.entry(dir.clone()).or_insert(0) += 1;
+            all_dirs.insert(dir.clone());
+            if i < 20 {
+                initial_dirs.insert(dir);
+            } else if !initial_dirs.contains(&dir) {
+                drift_dirs.insert(dir);
+            }
+        }
+
+        let drift_ratio = if all_dirs.is_empty() { 0.0 } else { drift_dirs.len() as f64 / all_dirs.len() as f64 };
+
+        // ── 7. Execution Speed ──
+        let now = now_ms() as i64;
+
+        // Ops per minute (last 60s)
+        let ops_last_60s = tool_calls.iter()
+            .filter(|tc| tc.started_at.map_or(false, |t| t >= now - 60_000))
+            .count() as f64;
+
+        // Average latency by tool
+        let mut latency_by_tool: HashMap<String, (f64, i64)> = HashMap::new();
+        for tc in &tool_calls {
+            if let (Some(start), Some(end)) = (tc.started_at, tc.completed_at) {
+                let dur = (end - start) as f64;
+                let entry = latency_by_tool.entry(tc.tool_name.clone()).or_insert((0.0, 0));
+                entry.0 += dur;
+                entry.1 += 1;
+            }
+        }
+        let avg_latency_by_tool: Vec<Value> = latency_by_tool.iter().map(|(name, (total, count))| {
+            json!({ "toolName": name, "avgMs": total / *count as f64, "count": count })
+        }).collect();
+
+        // Top 5 slowest
+        let mut completed_ops: Vec<(&ToolCallRow, i64)> = tool_calls.iter()
+            .filter_map(|tc| {
+                if let (Some(s), Some(e)) = (tc.started_at, tc.completed_at) {
+                    Some((tc, e - s))
+                } else { None }
+            })
+            .collect();
+        completed_ops.sort_by(|a, b| b.1.cmp(&a.1));
+        let slowest: Vec<Value> = completed_ops.iter().take(5).map(|(tc, dur)| {
+            json!({
+                "id": tc.id,
+                "toolName": tc.tool_name,
+                "filePath": extract_file_path(&tc.input),
+                "durationMs": dur,
+            })
+        }).collect();
+
+        // Speed sparkline: ops/min per 1-min bucket, last 10 min
+        let sparkline_start = now - 600_000;
+        let mut sparkline = vec![0i64; 10];
+        for tc in &tool_calls {
+            if let Some(t) = tc.started_at {
+                if t >= sparkline_start {
+                    let bucket = ((t - sparkline_start) / 60_000).min(9) as usize;
+                    sparkline[bucket] += 1;
+                }
+            }
+        }
+
+        // Think time vs Execute time
+        let mut execute_time_ms: i64 = 0;
+        let mut think_time_ms: i64 = 0;
+        let mut prev_completed: Option<i64> = None;
+        for tc in &tool_calls {
+            if let (Some(start), Some(end)) = (tc.started_at, tc.completed_at) {
+                execute_time_ms += end - start;
+                if let Some(prev_end) = prev_completed {
+                    let gap = start - prev_end;
+                    if gap > 0 && gap <= 300_000 { // cap at 5 min
+                        think_time_ms += gap;
+                    }
+                }
+                prev_completed = Some(end);
+            }
+        }
+
+        // ── 8. Iteration Depth ──
+        let iterations = self.list_iterations(session_id)?;
+        let total_iterations = iterations.len() as i64;
+        let current_iteration = iterations.last()
+            .and_then(|i| i["id"].as_i64()).unwrap_or(0);
+        let think_only_count = iterations.iter()
+            .filter(|i| i["completedAt"].is_i64() && !i["hasToolUse"].as_bool().unwrap_or(false))
+            .count() as i64;
+        let with_tools_count = iterations.iter()
+            .filter(|i| i["completedAt"].is_i64() && i["hasToolUse"].as_bool().unwrap_or(false))
+            .count() as i64;
+        let total_tools_in_iterations: i64 = iterations.iter()
+            .filter_map(|i| i["toolCount"].as_i64())
+            .sum();
+        let tools_per_iteration = if total_iterations > 0 {
+            total_tools_in_iterations as f64 / total_iterations as f64
+        } else { 0.0 };
+        let iteration_durations: Vec<i64> = iterations.iter()
+            .filter_map(|i| {
+                let start = i["startedAt"].as_i64()?;
+                let end = i["completedAt"].as_i64()?;
+                Some(end - start)
+            })
+            .collect();
+
+        // ── 9. File Dependencies ──
+        // Co-touched files: pairs operated on within ±30s
+        let mut co_touch_counts: HashMap<(String, String), i64> = HashMap::new();
+        for (i, op_a) in file_ops.iter().enumerate() {
+            for op_b in file_ops.iter().skip(i + 1) {
+                if op_a.file_path == op_b.file_path { continue; }
+                if (op_b.started_at - op_a.started_at).abs() <= 30_000 {
+                    let pair = if op_a.file_path < op_b.file_path {
+                        (op_a.file_path.clone(), op_b.file_path.clone())
+                    } else {
+                        (op_b.file_path.clone(), op_a.file_path.clone())
+                    };
+                    *co_touch_counts.entry(pair).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut co_touched: Vec<Value> = co_touch_counts.iter()
+            .map(|((a, b), count)| json!({ "fileA": a, "fileB": b, "count": count }))
+            .collect();
+        co_touched.sort_by(|a, b| b["count"].as_i64().cmp(&a["count"].as_i64()));
+        co_touched.truncate(20);
+
+        // Edit chain: last 30 sequential file ops
+        let edit_chain: Vec<Value> = file_ops.iter().rev().take(30).rev().map(|op| {
+            json!({ "toolName": op.tool_name, "filePath": op.file_path, "timestampMs": op.started_at })
+        }).collect();
+
+        // ── 10. Session Health ──
+        let focus_score = ((1.0 - drift_ratio) * 100.0).clamp(0.0, 100.0);
+        let efficiency_score = if total_ops > 0 {
+            ((unique_files.len() as f64 / total_ops as f64) * 100.0).clamp(0.0, 100.0)
+        } else { 100.0 };
+        let error_score = ((1.0 - error_rate) * 100.0).clamp(0.0, 100.0);
+        let overall_score = focus_score * 0.3 + efficiency_score * 0.3 + error_score * 0.4;
+        let level = if overall_score >= 70.0 { "good" }
+            else if overall_score >= 40.0 { "warning" }
+            else { "poor" };
+
+        Ok(json!({
+            "pulse": {
+                "totalOps": total_ops,
+                "errorCount": error_count,
+                "errorRate": error_rate,
+                "uniqueFileCount": unique_files.len(),
+                "sessionDurationMs": session_duration_ms,
+                "activeToolName": active_tool,
+            },
+            "fileActivity": file_activity,
+            "churnAlerts": churn_alerts,
+            "scopeDrift": {
+                "directoryCounts": dir_counts,
+                "initialDirectories": initial_dirs.iter().collect::<Vec<_>>(),
+                "driftDirectories": drift_dirs.iter().collect::<Vec<_>>(),
+                "driftRatio": drift_ratio,
+            },
+            "executionSpeed": {
+                "opsPerMinute": ops_last_60s,
+                "averageLatencyByTool": avg_latency_by_tool,
+                "slowestOperations": slowest,
+                "speedSparkline": sparkline,
+                "thinkTimeMs": think_time_ms,
+                "executeTimeMs": execute_time_ms,
+            },
+            "iterationDepth": {
+                "currentIteration": current_iteration,
+                "totalIterations": total_iterations,
+                "thinkOnlyCount": think_only_count,
+                "withToolsCount": with_tools_count,
+                "toolsPerIteration": tools_per_iteration,
+                "iterationDurationsMs": iteration_durations,
+            },
+            "fileDependencies": {
+                "coTouchedFiles": co_touched,
+                "editChain": edit_chain,
+            },
+            "health": {
+                "focusScore": focus_score,
+                "efficiencyScore": efficiency_score,
+                "errorScore": error_score,
+                "overallScore": overall_score,
+                "level": level,
+            },
+            "toolBreakdown": tool_breakdown_vec,
+        }))
+    }
+
     // ── Session Agents ──────────────────────────────────────────────────
 
     fn list_session_agents(&self, session_id: &str, include_left: bool) -> Result<Vec<Value>, rusqlite::Error> {
@@ -2296,6 +2725,7 @@ fn permission_row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
 pub struct ChatService {
     db: Arc<Mutex<ChatDb>>,         // project: workspace/.ultra/chat.db
     global_db: Arc<Mutex<ChatDb>>,  // global:  ~/.ultra/chat.db
+    notify_tx: parking_lot::RwLock<Option<crate::watch::NotifySender>>,
 }
 
 impl ChatService {
@@ -2310,6 +2740,7 @@ impl ChatService {
         Self {
             db: Arc::new(Mutex::new(db)),
             global_db: Arc::new(Mutex::new(global_db)),
+            notify_tx: parking_lot::RwLock::new(None),
         }
     }
 
@@ -2325,6 +2756,18 @@ impl ChatService {
         Self {
             db: Arc::new(Mutex::new(db)),
             global_db,
+            notify_tx: parking_lot::RwLock::new(None),
+        }
+    }
+
+    /// Set the notification callback for emitting events to clients.
+    pub fn set_notify_sender(&self, sender: crate::watch::NotifySender) {
+        *self.notify_tx.write() = Some(sender);
+    }
+
+    fn emit_notification(&self, method: &str, params: Value) {
+        if let Some(sender) = self.notify_tx.read().as_ref() {
+            sender(method, params);
         }
     }
 
@@ -2527,10 +2970,29 @@ impl Service for ChatService {
                 let p: ToolCallCompleteParams = parse_params(params)?;
                 let output_str = p.output.map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "null".into()));
                 let status = p.status.unwrap_or_else(|| "success".into());
+                let tc_id = p.id.clone();
 
                 let updated = self.with_db(move |db| {
                     db.complete_tool_call(&p.id, output_str.as_deref(), &status, p.error_message.as_deref())
                 }).await?;
+
+                // Push stats notification after completion
+                if updated && self.notify_tx.read().is_some() {
+                    let stats_result = self.with_db(move |db| {
+                        let session_id: String = db.conn.query_row(
+                            "SELECT session_id FROM tool_calls WHERE id = ?1",
+                            rusqlite::params![tc_id], |row| row.get(0),
+                        )?;
+                        let stats = db.session_stats(&session_id)?;
+                        Ok::<_, rusqlite::Error>((session_id, stats))
+                    }).await;
+                    if let Ok((session_id, stats)) = stats_result {
+                        self.emit_notification("stats/updated", json!({
+                            "sessionId": session_id,
+                            "stats": stats
+                        }));
+                    }
+                }
 
                 Ok(json!({ "success": updated }))
             }
@@ -2708,6 +3170,7 @@ impl Service for ChatService {
                         metadata_str.as_deref(), p.validation_criteria.as_deref(),
                     )
                 }).await?;
+                self.emit_notification("chat/document/created", json!({ "document": &doc }));
                 Ok(doc)
             }
 
@@ -2744,12 +3207,19 @@ impl Service for ChatService {
                         p.validation_criteria.as_deref(), metadata_str.as_deref(),
                     )
                 }).await?;
+                if let Some(ref d) = doc {
+                    self.emit_notification("chat/document/updated", json!({ "document": d }));
+                }
                 Ok(doc.unwrap_or(Value::Null))
             }
 
             "chat/document/delete" => {
                 let p: IdParam = parse_params(params)?;
+                let doc_id = p.id.clone();
                 let deleted = self.with_db(move |db| db.delete_document(&p.id)).await?;
+                if deleted {
+                    self.emit_notification("chat/document/deleted", json!({ "id": doc_id }));
+                }
                 Ok(json!({ "success": deleted }))
             }
 
@@ -2807,6 +3277,27 @@ impl Service for ChatService {
                 let p: OptionalSessionIdParam = parse_params_optional(params);
                 let stats = self.with_db(move |db| db.stats(p.session_id.as_deref())).await?;
                 Ok(json!({ "stats": stats }))
+            }
+
+            "chat/stats/session" => {
+                let p: SessionIdParam = parse_params(params)?;
+                let stats = self.with_db(move |db| db.session_stats(&p.session_id)).await?;
+                Ok(stats)
+            }
+
+            // ── Iterations ──────────────────────────────────────────
+            "chat/iteration/start" => {
+                let p: IterationStartParams = parse_params(params)?;
+                self.with_db(move |db| db.start_iteration(&p.session_id, p.iteration_id)).await?;
+                Ok(json!({ "success": true }))
+            }
+
+            "chat/iteration/complete" => {
+                let p: IterationCompleteParams = parse_params(params)?;
+                self.with_db(move |db| {
+                    db.complete_iteration(&p.session_id, p.iteration_id, p.has_tool_use, p.tool_count.unwrap_or(0))
+                }).await?;
+                Ok(json!({ "success": true }))
             }
 
             // ── Context ──────────────────────────────────────────────
@@ -3302,6 +3793,26 @@ struct ToolCallListParams {
 struct ToolCallUpdateInputParams {
     id: String,
     input: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct IterationStartParams {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "iterationId")]
+    iteration_id: i64,
+}
+
+#[derive(Deserialize)]
+struct IterationCompleteParams {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "iterationId")]
+    iteration_id: i64,
+    #[serde(rename = "hasToolUse")]
+    has_tool_use: bool,
+    #[serde(rename = "toolCount")]
+    tool_count: Option<i64>,
 }
 
 #[derive(Deserialize)]

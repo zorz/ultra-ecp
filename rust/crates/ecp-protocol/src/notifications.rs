@@ -86,6 +86,7 @@ impl Notifications {
     pub const CHAT_TODO_UPDATED: &str = "chat/todo/updated";
     pub const CHAT_DOCUMENT_CREATED: &str = "chat/document/created";
     pub const CHAT_DOCUMENT_UPDATED: &str = "chat/document/updated";
+    pub const CHAT_DOCUMENT_DELETED: &str = "chat/document/deleted";
 
     // ── Agent ───────────────────────────────────────────────────────────
     pub const AGENT_CREATED: &str = "agent/created";

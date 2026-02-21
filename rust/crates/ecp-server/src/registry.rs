@@ -257,14 +257,17 @@ impl WorkspaceRegistry {
             });
 
         let watch_service = WatchService::new(path.to_path_buf());
-        watch_service.set_notify_sender(notify_sender);
+        watch_service.set_notify_sender(notify_sender.clone());
+
+        let chat_service = ChatService::new_with_global_db(path, self.global_chat_db.clone());
+        chat_service.set_notify_sender(notify_sender);
 
         let mut services: Vec<Box<dyn ServiceDyn>> = Vec::new();
         services.push(Box::new(FileService::new(path.to_path_buf())));
         services.push(Box::new(GitService::new(path.to_path_buf())));
         services.push(Box::new(TerminalService::new(path.to_path_buf())));
         services.push(Box::new(SessionService::new(path.to_path_buf())));
-        services.push(Box::new(ChatService::new_with_global_db(path, self.global_chat_db.clone())));
+        services.push(Box::new(chat_service));
         services.push(Box::new(DatabaseService::new(path.to_path_buf())));
         services.push(Box::new(LSPService::new(path.to_path_buf())));
         services.push(Box::new(watch_service));

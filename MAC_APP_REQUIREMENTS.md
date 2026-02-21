@@ -809,3 +809,16 @@ The `SessionState` struct also uses `#[serde(rename_all = "camelCase")]` with `a
 ~~**Symptom:** File changes not reflected in editor or file tree after multi-workspace refactor.~~
 
 **Fixed:** The multi-workspace refactor moved WatchService notifications from the global broadcast channel to per-workspace channels. But clients using the `--workspace` default (without calling `workspace/open`) never subscribed to the per-workspace channel. **Fix:** Added `default_workspace_id()` to `RequestHandler` trait. Transport auto-subscribes to the default workspace's notification channel immediately after authentication.
+
+### Document change notifications not emitted — FIXED
+
+~~**Symptom:** Documents created or updated by AI agents never appear or refresh in the Mac app's document list.~~
+
+**Fixed:** Added `emit_notification()` calls to the three document mutation handlers in `chat.rs`:
+- `chat/document/create` → emits `chat/document/created` with `{ "document": <full doc> }`
+- `chat/document/update` → emits `chat/document/updated` with `{ "document": <full doc> }` (when update returns a document)
+- `chat/document/delete` → emits `chat/document/deleted` with `{ "id": "<doc-id>" }` (when delete succeeds)
+
+Also added missing `CHAT_DOCUMENT_DELETED` constant to `ecp-protocol/src/notifications.rs`. Notifications flow through the per-workspace broadcast channel (same as `stats/updated` and `file/didChange`).
+
+---
