@@ -118,6 +118,8 @@ struct AppState<H: RequestHandler> {
     notification_tx: broadcast::Sender<String>,
     /// Connected client count (for health check)
     client_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Fires when the last client disconnects (client_count drops to 0 after being > 0)
+    disconnect_notify: Arc<tokio::sync::Notify>,
 }
 
 /// The transport server — manages WebSocket connections and routes messages.
@@ -132,6 +134,10 @@ pub struct TransportServer {
     port: u16,
     /// Whether TLS is enabled
     tls_enabled: bool,
+    /// Live client count
+    client_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Fires when the last client disconnects
+    disconnect_notify: Arc<tokio::sync::Notify>,
 }
 
 impl TransportServer {
@@ -155,12 +161,14 @@ impl TransportServer {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
         let client_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let disconnect_notify = Arc::new(tokio::sync::Notify::new());
 
         let state = Arc::new(AppState {
             handler,
             config: config.clone(),
             notification_tx: notification_tx.clone(),
             client_count: client_count.clone(),
+            disconnect_notify: disconnect_notify.clone(),
         });
 
         let app = Router::new()
@@ -234,6 +242,8 @@ impl TransportServer {
             handle: Some(handle),
             port: actual_port,
             tls_enabled,
+            client_count,
+            disconnect_notify,
         })
     }
 
@@ -258,6 +268,17 @@ impl TransportServer {
     /// Whether TLS is enabled.
     pub fn is_tls(&self) -> bool {
         self.tls_enabled
+    }
+
+    /// Get a handle to the live client count for external monitoring.
+    pub fn client_count(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.client_count.clone()
+    }
+
+    /// Get the disconnect notify — fires when the last client disconnects
+    /// (client_count drops to 0 after having been > 0).
+    pub fn disconnect_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.disconnect_notify.clone()
     }
 
     /// Gracefully stop the server.
@@ -490,9 +511,11 @@ async fn handle_ws_connection<H: RequestHandler>(
     // Notify the handler that this client disconnected
     state.handler.on_client_disconnected(&client_id).await;
 
-    state.client_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    info!("Client disconnected: {client_id} (total: {})",
-        state.client_count.load(std::sync::atomic::Ordering::Relaxed));
+    let remaining = state.client_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) - 1;
+    if remaining == 0 {
+        state.disconnect_notify.notify_one();
+    }
+    info!("Client disconnected: {client_id} (total: {remaining})");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

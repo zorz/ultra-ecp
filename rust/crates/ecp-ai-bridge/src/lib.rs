@@ -112,10 +112,8 @@ struct BridgeError {
 
 /// The AI Bridge — manages communication with the TypeScript subprocess.
 pub struct AIBridge {
-    /// Channel to send requests to the subprocess writer task
-    request_tx: Option<mpsc::Sender<WriterMessage>>,
-    /// Child process handle
-    child: Option<Child>,
+    /// Mutable state protected for shutdown from Arc
+    mutable: parking_lot::Mutex<AIBridgeMut>,
     /// Next request ID
     next_id: std::sync::atomic::AtomicU64,
     /// Whether the bridge is running
@@ -127,6 +125,12 @@ pub struct AIBridge {
     callback_handler: Arc<OnceLock<CallbackHandler>>,
 }
 
+/// Mutable fields that need to be accessed during shutdown from an Arc.
+struct AIBridgeMut {
+    request_tx: Option<mpsc::Sender<WriterMessage>>,
+    child: Option<Child>,
+}
+
 /// Messages sent to the writer task (either requests or callback responses).
 enum WriterMessage {
     Request(BridgeRequest, oneshot::Sender<Result<Value, ECPError>>),
@@ -136,8 +140,10 @@ enum WriterMessage {
 impl AIBridge {
     pub fn new() -> Self {
         Self {
-            request_tx: None,
-            child: None,
+            mutable: parking_lot::Mutex::new(AIBridgeMut {
+                request_tx: None,
+                child: None,
+            }),
             next_id: std::sync::atomic::AtomicU64::new(1),
             running: std::sync::atomic::AtomicBool::new(false),
             notification_tx: None,
@@ -358,8 +364,11 @@ impl AIBridge {
             }
         });
 
-        self.request_tx = Some(writer_tx);
-        self.child = Some(child);
+        {
+            let mut state = self.mutable.lock();
+            state.request_tx = Some(writer_tx);
+            state.child = Some(child);
+        }
 
         // Wait for the bridge to signal readiness (ai/bridge/ready notification)
         match tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx).await {
@@ -372,7 +381,7 @@ impl AIBridge {
             Ok(Err(_)) => {
                 // Channel dropped — bridge process exited before sending ready
                 warn!("AI bridge process exited before signaling ready");
-                self.request_tx = None;
+                self.mutable.lock().request_tx = None;
                 Err("AI bridge process exited before signaling ready".into())
             }
             Err(_) => {
@@ -388,10 +397,11 @@ impl AIBridge {
 
     /// Send a request to the AI bridge and wait for a response.
     pub async fn request(&self, method: &str, params: Option<Value>) -> HandlerResult {
-        let tx = self
-            .request_tx
-            .as_ref()
-            .ok_or_else(|| ECPError::server_error("AI bridge not started"))?;
+        let tx = {
+            let state = self.mutable.lock();
+            state.request_tx.clone()
+                .ok_or_else(|| ECPError::server_error("AI bridge not started"))?
+        };
 
         let id = self
             .next_id
@@ -419,12 +429,15 @@ impl AIBridge {
     }
 
     /// Shutdown the bridge subprocess.
-    pub async fn shutdown(&mut self) {
+    pub async fn shutdown(&self) {
         self.running
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.request_tx = None;
-
-        if let Some(mut child) = self.child.take() {
+        let mut child = {
+            let mut state = self.mutable.lock();
+            state.request_tx = None;
+            state.child.take()
+        };
+        if let Some(ref mut child) = child {
             let _ = child.kill().await;
             info!("AI bridge subprocess terminated");
         }

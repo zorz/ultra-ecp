@@ -493,6 +493,7 @@ version = "0.1.0"
 dependencies = [
  "dashmap",
  "ecp-protocol",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror",

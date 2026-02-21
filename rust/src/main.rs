@@ -13,6 +13,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use clap::Parser;
 use ecp_ai_bridge::{AIBridge, AIBridgeConfig};
@@ -82,6 +84,15 @@ struct Cli {
     /// Write logs to a file (defaults to ~/.ultra/logs/ecp.log if no path given)
     #[arg(long, default_missing_value = "DEFAULT", num_args = 0..=1)]
     log_file: Option<String>,
+
+    /// Remote mode: exit when all clients disconnect (5s grace period).
+    /// Implies --idle-timeout 300 unless overridden.
+    #[arg(long)]
+    remote: bool,
+
+    /// Exit after N seconds with zero connections (0 = disabled)
+    #[arg(long)]
+    idle_timeout: Option<u64>,
 }
 
 /// Resolve the bun binary path, checking common installation locations.
@@ -317,6 +328,17 @@ async fn main() {
         Some(tls) => println!("  TLS:        enabled (cert: {})", tls.cert_path.display()),
         None => println!("  TLS:        disabled (--no-tls)"),
     }
+
+    // Resolve effective idle timeout
+    let idle_timeout_secs = cli.idle_timeout
+        .unwrap_or(if cli.remote { 300 } else { 0 });
+    let exit_on_disconnect = cli.remote;
+
+    if cli.remote {
+        println!("  Mode:       remote (exit on disconnect, idle timeout: {idle_timeout_secs}s)");
+    } else if idle_timeout_secs > 0 {
+        println!("  Mode:       idle timeout ({idle_timeout_secs}s)");
+    }
     println!();
 
     // Open global ChatDb — shared across all workspaces
@@ -349,15 +371,13 @@ async fn main() {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
 
-        // Check for compiled ai-bridge binary next to ultra-ecp (app bundle case)
-        let compiled_binary = {
-            let candidate = exe_dir.join("ai-bridge");
-            if candidate.exists() && candidate.is_file() {
-                Some(candidate)
-            } else {
-                None
-            }
-        };
+        // Check for compiled ai-bridge binary: next to ultra-ecp, then ~/.ultra/
+        let compiled_binary = [
+            exe_dir.join("ai-bridge"),
+            PathBuf::from(&home).join(".ultra/ai-bridge"),
+        ]
+        .into_iter()
+        .find(|p| p.exists() && p.is_file());
 
         // Look for ai-bridge/index.ts — binary is at rust/target/{debug,release}/ultra-ecp
         // so we need to go up 3 levels to reach the project root
@@ -564,15 +584,63 @@ async fn main() {
         });
     }
 
+    let client_count = transport.client_count();
+    let disconnect_notify = transport.disconnect_notify();
+
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
+        _ = tokio::signal::ctrl_c() => {
+            println!("  Ctrl+C received");
+        }
         _ = shutdown_notify.notified() => {
             eprintln!("stdin closed (parent process gone) — shutting down");
+        }
+        _ = async {
+            // --remote: wait for all clients to disconnect, then grace period
+            if exit_on_disconnect {
+                // Wait until at least one client has connected first
+                while client_count.load(Ordering::Relaxed) == 0 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                // Now wait for all to disconnect
+                loop {
+                    disconnect_notify.notified().await;
+                    // Grace period — if a new client connects within 5s, keep going
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    if client_count.load(Ordering::Relaxed) == 0 {
+                        break;
+                    }
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            println!("  All clients disconnected — shutting down (--remote)");
+        }
+        _ = async {
+            // --idle-timeout: exit after N seconds with no connections
+            if idle_timeout_secs > 0 {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(idle_timeout_secs)).await;
+                    if client_count.load(Ordering::Relaxed) == 0 {
+                        break;
+                    }
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            println!("  Idle timeout ({idle_timeout_secs}s with no clients) — shutting down");
         }
     }
 
     println!();
     println!("  Shutting down...");
+
+    // Shutdown bridge subprocess
+    if let Some(ref bridge) = bridge_arc {
+        bridge.shutdown().await;
+    }
+
     transport.stop().await;
 
     // Clean up server.json on graceful shutdown
