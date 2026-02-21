@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     initial_input TEXT,
     final_output TEXT,
     error_message TEXT,
+    cli_session_id TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
     updated_at INTEGER,
     completed_at INTEGER,
@@ -703,6 +704,8 @@ impl ChatDb {
         self.ensure_column("agents", "scope", "TEXT NOT NULL DEFAULT 'global'");
         self.ensure_column("agents", "config", "JSON NOT NULL DEFAULT '{}'");
 
+        self.ensure_column("sessions", "cli_session_id", "TEXT");
+
         self.ensure_column("documents", "agent_id", "TEXT");
         self.ensure_column("documents", "summary", "TEXT");
         self.ensure_column("documents", "status", "TEXT DEFAULT 'draft'");
@@ -749,16 +752,21 @@ impl ChatDb {
     }
 
     fn column_exists(&self, table: &str, column: &str) -> bool {
+        let sql = format!(
+            "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"
+        );
         self.conn
-            .prepare(&format!("SELECT \"{column}\" FROM \"{table}\" LIMIT 0"))
-            .is_ok()
+            .query_row(&sql, [], |row| row.get::<_, i64>(0))
+            .map(|count| count > 0)
+            .unwrap_or(false)
     }
 
     fn ensure_column(&self, table: &str, column: &str, definition: &str) {
         if !self.column_exists(table, column) {
-            let _ = self.conn.execute_batch(&format!(
-                "ALTER TABLE \"{table}\" ADD COLUMN \"{column}\" {definition}"
-            ));
+            let sql = format!("ALTER TABLE \"{table}\" ADD COLUMN \"{column}\" {definition}");
+            if let Err(e) = self.conn.execute(&sql, []) {
+                eprintln!("[chat migration] Failed to add {table}.{column}: {e}");
+            }
         }
     }
 
@@ -767,12 +775,13 @@ impl ChatDb {
     fn create_session(
         &self, id: &str, title: Option<&str>, provider: &str, model: &str,
         system_prompt: Option<&str>, workflow_id: Option<&str>,
+        cli_session_id: Option<&str>,
     ) -> Result<(), rusqlite::Error> {
         let now = now_ms() as i64;
         self.conn.execute(
-            "INSERT INTO sessions (id, title, provider, model, system_prompt, workflow_id, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?7)",
-            rusqlite::params![id, title, provider, model, system_prompt, workflow_id, now],
+            "INSERT INTO sessions (id, title, provider, model, system_prompt, workflow_id, cli_session_id, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?8)",
+            rusqlite::params![id, title, provider, model, system_prompt, workflow_id, cli_session_id, now],
         )?;
         Ok(())
     }
@@ -782,7 +791,7 @@ impl ChatDb {
             "SELECT id, title, workflow_id, provider, model, system_prompt, status,
                     current_node_id, iteration_count, max_iterations,
                     initial_input, final_output, error_message,
-                    created_at, updated_at, completed_at
+                    created_at, updated_at, completed_at, cli_session_id
              FROM sessions WHERE id = ?1"
         )?;
         let mut rows = stmt.query(rusqlite::params![id])?;
@@ -796,7 +805,7 @@ impl ChatDb {
     fn update_session(
         &self, id: &str, title: Option<&str>, status: Option<&str>,
         model: Option<&str>, provider: Option<&str>, system_prompt: Option<&str>,
-        error_message: Option<&str>,
+        error_message: Option<&str>, cli_session_id: Option<&str>,
     ) -> Result<bool, rusqlite::Error> {
         let now = now_ms() as i64;
         let mut sets = vec!["updated_at = ?1".to_string()];
@@ -819,6 +828,7 @@ impl ChatDb {
         add_set!(provider, "provider");
         add_set!(system_prompt, "system_prompt");
         add_set!(error_message, "error_message");
+        add_set!(cli_session_id, "cli_session_id");
 
         // If status is a terminal state, set completed_at
         if let Some(s) = status {
@@ -846,7 +856,8 @@ impl ChatDb {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.title, s.provider, s.model, s.created_at,
                     COUNT(m.id) as message_count,
-                    MAX(m.created_at) as last_message_at
+                    MAX(m.created_at) as last_message_at,
+                    s.status, s.cli_session_id
              FROM sessions s
              LEFT JOIN messages m ON m.session_id = s.id
              GROUP BY s.id
@@ -862,6 +873,8 @@ impl ChatDb {
                 "createdAt": row.get::<_, i64>(4)?,
                 "messageCount": row.get::<_, i64>(5)?,
                 "lastMessageAt": row.get::<_, Option<i64>>(6)?,
+                "status": row.get::<_, String>(7)?,
+                "cliSessionId": row.get::<_, Option<String>>(8)?,
             }))
         })?;
         rows.collect()
@@ -1052,7 +1065,7 @@ impl ChatDb {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&v) {
                         parsed
                     } else if v.len() > 2000 {
-                        Value::String(format!("{}…", &v[..2000]))
+                        Value::String(format!("{}…", truncate_str(&v, 2000)))
                     } else {
                         Value::String(v)
                     }
@@ -1597,7 +1610,7 @@ impl ChatDb {
                 let model: Option<String> = row.get(6)?;
                 let created_at: i64 = row.get(7)?;
                 let display = agent_name.as_deref().unwrap_or(&role);
-                let snippet: &str = if content.len() > 80 { &content[..80] } else { &content };
+                let snippet: &str = truncate_str(&content, 80);
                 Ok(json!({
                     "sessionId": sid, "activityType": "message_added",
                     "entityType": "message", "entityId": mid,
@@ -1692,7 +1705,7 @@ impl ChatDb {
             |row: &rusqlite::Row<'_>| {
                 let content: String = row.get(3)?;
                 let status: String = row.get(4)?;
-                let snippet: &str = if content.len() > 60 { &content[..60] } else { &content };
+                let snippet: &str = truncate_str(&content, 60);
                 Ok(json!({
                     "sessionId": row.get::<_, Option<String>>(1)?,
                     "activityType": "todo_updated",
@@ -2111,6 +2124,7 @@ fn session_row_to_json(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "createdAt": row.get::<_, i64>(13)?,
         "updatedAt": row.get::<_, Option<i64>>(14)?,
         "completedAt": row.get::<_, Option<i64>>(15)?,
+        "cliSessionId": row.get::<_, Option<String>>(16)?,
     }))
 }
 
@@ -2391,10 +2405,11 @@ impl Service for ChatService {
                 let title_clone = p.title.clone();
                 let sp_clone = p.system_prompt.clone();
                 let wf_clone = p.workflow_id.clone();
+                let cli_clone = p.cli_session_id.clone();
                 let id_clone = id.clone();
 
                 self.with_db(move |db| {
-                    db.create_session(&id_clone, title_clone.as_deref(), &provider, &model, sp_clone.as_deref(), wf_clone.as_deref())
+                    db.create_session(&id_clone, title_clone.as_deref(), &provider, &model, sp_clone.as_deref(), wf_clone.as_deref(), cli_clone.as_deref())
                 }).await?;
 
                 Ok(json!({ "id": id }))
@@ -2417,6 +2432,7 @@ impl Service for ChatService {
                         &p.session_id, p.title.as_deref(), p.status.as_deref(),
                         p.model.as_deref(), p.provider.as_deref(),
                         p.system_prompt.as_deref(), p.error_message.as_deref(),
+                        p.cli_session_id.as_deref(),
                     )
                 }).await?;
                 Ok(json!({ "success": updated }))
@@ -3149,6 +3165,8 @@ struct SessionCreateParams {
     system_prompt: Option<String>,
     #[serde(rename = "workflowId")]
     workflow_id: Option<String>,
+    #[serde(rename = "cliSessionId")]
+    cli_session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3169,6 +3187,8 @@ struct SessionUpdateParams {
     system_prompt: Option<String>,
     #[serde(rename = "errorMessage")]
     error_message: Option<String>,
+    #[serde(rename = "cliSessionId")]
+    cli_session_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -3615,6 +3635,18 @@ fn parse_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> Result<T
 
 fn parse_params_optional<T: for<'de> Deserialize<'de> + Default>(params: Option<Value>) -> T {
     params.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
+}
+
+/// Truncate a string to at most `max_bytes`, snapping to a char boundary.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn now_ms() -> u64 {

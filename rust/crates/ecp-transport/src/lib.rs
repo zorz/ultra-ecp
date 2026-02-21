@@ -13,4 +13,4 @@ pub mod client;
 pub mod server;
 
 pub use client::ClientConnection;
-pub use server::{TransportServer, TransportConfig, RequestHandler};
+pub use server::{TransportServer, TransportConfig, TlsConfig, RequestHandler};

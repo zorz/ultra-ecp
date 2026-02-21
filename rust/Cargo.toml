@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 rand = { workspace = true }
 parking_lot = { workspace = true }
 hex = "0.4"
+rcgen = { workspace = true }
+hostname = { workspace = true }
 
 [workspace]
 resolver = "2"
@@ -53,6 +55,7 @@ futures-util = "0.3"
 
 # HTTP
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 hyper = { version = "1", features = ["full"] }
@@ -90,6 +93,10 @@ secrecy = { version = "0.10", features = ["serde"] }
 
 # Database
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
+
+# TLS
+rcgen = "0.13"
+hostname = "0.4"
 
 # Directories
 dirs = "6"

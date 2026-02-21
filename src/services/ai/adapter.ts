@@ -987,6 +987,19 @@ export class AIServiceAdapter {
         });
       });
 
+      // After streaming completes, persist SDK session ID if available
+      if (this.ecpRequest && p.storageSessionId) {
+        const aiSession = this.service.getSession(streamSessionId);
+        if (aiSession?.cliSessionId) {
+          this.ecpRequest('chat/session/update', {
+            sessionId: p.storageSessionId,
+            cliSessionId: aiSession.cliSessionId,
+          }).catch((err) => {
+            debugLog(`[AIServiceAdapter] Failed to persist cliSessionId: ${err}`);
+          });
+        }
+      }
+
       // After streaming completes, check for handoff
       if (handoffState.pending) {
         const ho = handoffState.pending;
@@ -2209,13 +2222,14 @@ export class AIServiceAdapter {
 
     try {
       // 1. Load chat session metadata
-      const sessionData = await this.ecpRequest('chat/session/get', { id: p.chatSessionId }) as {
+      const sessionData = await this.ecpRequest('chat/session/get', { sessionId: p.chatSessionId }) as {
         session?: {
           id: string;
           provider?: string;
           model?: string;
           systemPrompt?: string;
           title?: string;
+          cliSessionId?: string;
         };
       } | null;
 
@@ -2229,7 +2243,28 @@ export class AIServiceAdapter {
       const model = p.model ?? chatSession.model ?? this.getDefaultModel?.() ?? undefined;
       const systemPrompt = chatSession.systemPrompt ?? '';
 
-      // 3. Load active messages
+      // 2b. Agent SDK sessions resume via the SDK's own session management.
+      // Don't replay messages — the SDK manages its own context/compaction.
+      if (provider === 'agent-sdk' && chatSession.cliSessionId) {
+        const session = await this.service.createSession({
+          provider: { type: 'agent-sdk', name: 'Claude (Agent SDK)', model },
+          systemPrompt,
+          cliSessionId: chatSession.cliSessionId,
+          cwd: this.getWorkspacePath(),
+        });
+
+        return {
+          result: {
+            aiSessionId: session.id,
+            provider: 'agent-sdk',
+            model: model ?? session.provider.model,
+            sdkSessionId: chatSession.cliSessionId,
+            resumed: true,
+          },
+        };
+      }
+
+      // 3. Load active messages (for non-agent-sdk providers)
       const messagesResult = await this.ecpRequest('chat/message/list', {
         sessionId: p.chatSessionId,
         limit: 1000,

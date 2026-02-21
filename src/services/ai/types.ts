@@ -326,7 +326,10 @@ export type StreamEventType =
   | 'error'
   | 'agent_status'
   | 'agent_joined'
-  | 'agent_left';
+  | 'agent_left'
+  | 'compact_boundary'
+  | 'result_usage'
+  | 'todo_update';
 
 /**
  * Agent role for multi-agent events.
@@ -581,6 +584,33 @@ export interface AgentLeftEvent extends StreamEventBase {
 }
 
 /**
+ * SDK compact boundary event - emitted when Claude Code auto-compacts context.
+ */
+export interface CompactBoundaryEvent extends StreamEventBase {
+  type: 'compact_boundary';
+  trigger: 'manual' | 'auto';
+  preTokens: number;
+}
+
+/**
+ * SDK result usage event - emitted with token/cost data after query completes.
+ */
+export interface ResultUsageEvent extends StreamEventBase {
+  type: 'result_usage';
+  usage?: { input_tokens: number; output_tokens: number };
+  modelUsage?: Record<string, { contextWindow: number; costUSD: number }>;
+  totalCostUsd?: number;
+}
+
+/**
+ * Todo update event - emitted when TodoWrite tool is used.
+ */
+export interface TodoUpdateEvent extends StreamEventBase {
+  type: 'todo_update';
+  todos: unknown[];
+}
+
+/**
  * All streaming event types.
  */
 export type StreamEvent =
@@ -602,7 +632,10 @@ export type StreamEvent =
   | IterationCompleteEvent
   | AgentStatusEvent
   | AgentJoinedEvent
-  | AgentLeftEvent;
+  | AgentLeftEvent
+  | CompactBoundaryEvent
+  | ResultUsageEvent
+  | TodoUpdateEvent;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Response Types

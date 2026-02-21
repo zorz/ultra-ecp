@@ -25,7 +25,7 @@ use ecp_services::{
     models::ModelsService,
     secret::SecretService,
 };
-use ecp_transport::server::{TransportConfig, TransportServer};
+use ecp_transport::server::{TransportConfig, TlsConfig, TransportServer};
 use ecp_transport::RequestHandler;
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
@@ -66,6 +66,22 @@ struct Cli {
     /// Path to the bun runtime binary
     #[arg(long)]
     bun_path: Option<String>,
+
+    /// Disable TLS (for development/debugging)
+    #[arg(long)]
+    no_tls: bool,
+
+    /// Path to custom TLS certificate (PEM)
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// Path to custom TLS private key (PEM)
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+
+    /// Write logs to a file (defaults to ~/.ultra/logs/ecp.log if no path given)
+    #[arg(long, default_missing_value = "DEFAULT", num_args = 0..=1)]
+    log_file: Option<String>,
 }
 
 /// Resolve the bun binary path, checking common installation locations.
@@ -101,6 +117,54 @@ fn resolve_bun_path() -> String {
     "bun".to_string()
 }
 
+/// Ensure TLS certificate and key exist at `~/.ultra/tls/`, generating if needed.
+/// Returns (cert_path, key_path).
+fn ensure_tls_certs() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let tls_dir = PathBuf::from(&home).join(".ultra/tls");
+    let cert_path = tls_dir.join("cert.pem");
+    let key_path = tls_dir.join("key.pem");
+
+    // Reuse existing certs if they exist
+    if cert_path.exists() && key_path.exists() {
+        return Ok((cert_path, key_path));
+    }
+
+    std::fs::create_dir_all(&tls_dir)?;
+
+    // Build SANs: localhost, 127.0.0.1, ::1, and the machine hostname
+    let mut sans = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Ok(hostname) = hostname::get() {
+        let hostname = hostname.to_string_lossy().to_string();
+        if !sans.contains(&hostname) {
+            sans.push(hostname);
+        }
+    }
+
+    let subject_alt_names: Vec<rcgen::SanType> = sans.iter().map(|s| {
+        if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+            rcgen::SanType::IpAddress(ip)
+        } else {
+            rcgen::SanType::DnsName(s.clone().try_into().unwrap())
+        }
+    }).collect();
+
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
+    params.subject_alt_names = subject_alt_names;
+
+    let key_pair = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+
+    std::fs::write(&cert_path, cert.pem())?;
+    std::fs::write(&key_path, key_pair.serialize_pem())?;
+
+    Ok((cert_path, key_path))
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -111,9 +175,38 @@ async fn main() {
     } else {
         EnvFilter::new("info")
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+
+    if let Some(ref log_file_arg) = cli.log_file {
+        // Resolve log file path
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let log_path = if log_file_arg == "DEFAULT" {
+            PathBuf::from(&home).join(".ultra/logs/ecp.log")
+        } else {
+            PathBuf::from(log_file_arg)
+        };
+
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap_or_else(|e| panic!("Failed to open log file {}: {e}", log_path.display()));
+
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .init();
+
+        eprintln!("Logging to {}", log_path.display());
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .init();
+    };
 
     // Resolve workspace root if provided
     let workspace_root = cli.workspace.map(|w| {
@@ -129,6 +222,24 @@ async fn main() {
         hex::encode(bytes)
     });
 
+    // Resolve TLS configuration
+    let tls_config = if cli.no_tls {
+        None
+    } else if let (Some(cert), Some(key)) = (&cli.tls_cert, &cli.tls_key) {
+        Some(TlsConfig {
+            cert_path: cert.clone(),
+            key_path: key.clone(),
+        })
+    } else {
+        match ensure_tls_certs() {
+            Ok((cert_path, key_path)) => Some(TlsConfig { cert_path, key_path }),
+            Err(e) => {
+                warn!("Failed to generate TLS certs, falling back to plain TCP: {e}");
+                None
+            }
+        }
+    };
+
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                     Ultra ECP Server                        ║");
@@ -142,6 +253,10 @@ async fn main() {
     }
     println!("  Port:       {}", cli.port);
     println!("  Binding:    {} (localhost only)", cli.hostname);
+    match &tls_config {
+        Some(tls) => println!("  TLS:        enabled (cert: {})", tls.cert_path.display()),
+        None => println!("  TLS:        disabled (--no-tls)"),
+    }
     println!();
 
     // Open global ChatDb — shared across all workspaces
@@ -296,6 +411,7 @@ async fn main() {
         max_connections: Some(cli.max_connections),
         workspace_root: workspace_root.as_ref().map(|w| w.to_string_lossy().to_string()),
         verbose_logging: cli.verbose,
+        tls: tls_config,
     };
 
     // Start transport server with the shared notification channel and Arc<ECPServer>
@@ -308,7 +424,8 @@ async fn main() {
     };
 
     let actual_port = transport.port();
-    let ws_url = format!("ws://{}:{}/ws", cli.hostname, actual_port);
+    let scheme = if transport.is_tls() { "wss" } else { "ws" };
+    let ws_url = format!("{scheme}://{}:{}/ws", cli.hostname, actual_port);
 
     println!("────────────────────────────────────────────────────────────────");
     println!();
@@ -318,7 +435,11 @@ async fn main() {
     println!("    {ws_url}");
     println!();
     println!("  Auth token:");
-    println!("    {}...{}", &auth_token[..8], &auth_token[auth_token.len()-8..]);
+    if auth_token.len() > 16 {
+        println!("    {}...{}", &auth_token[..8], &auth_token[auth_token.len()-8..]);
+    } else {
+        println!("    {}", &auth_token);
+    }
     println!();
     println!("────────────────────────────────────────────────────────────────");
     println!();

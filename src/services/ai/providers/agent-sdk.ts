@@ -135,6 +135,11 @@ export class AgentSDKProvider extends BaseAIProvider {
     return this.sdkSessionId;
   }
 
+  /** Restore session ID for resume (matches claude/openai/gemini providers) */
+  setSessionId(sessionId: string): void {
+    this.sdkSessionId = sessionId;
+  }
+
   /** Set the permission registry callback for bridging to LocalAIService */
   setPermissionRegistry(register: PermissionRegistryFn): void {
     this.registerPermission = register;
@@ -427,6 +432,19 @@ export class AgentSDKProvider extends BaseAIProvider {
           if (subtype === 'init') {
             this.sdkSessionId = msg.session_id as string;
             debugLog(`[AgentSDK] Session initialized: ${this.sdkSessionId}`);
+          } else if (subtype === 'compact_boundary') {
+            const metadata = msg.compact_metadata as {
+              trigger: 'manual' | 'auto';
+              pre_tokens: number;
+            } | undefined;
+            if (metadata) {
+              onEvent({
+                type: 'compact_boundary',
+                trigger: metadata.trigger,
+                preTokens: metadata.pre_tokens,
+              } as StreamEvent);
+              debugLog(`[AgentSDK] Compact boundary: trigger=${metadata.trigger}, pre_tokens=${metadata.pre_tokens}`);
+            }
           }
           break;
         }
@@ -534,6 +552,19 @@ export class AgentSDKProvider extends BaseAIProvider {
             if (apiKeySource) {
               this.detectedAuthMethod = apiKeySource;
               debugLog(`[AgentSDK] Auth method: ${apiKeySource}`);
+            }
+
+            // Relay usage/cost data to client
+            const usage = msg.usage as { input_tokens: number; output_tokens: number } | undefined;
+            const modelUsage = msg.modelUsage as Record<string, { contextWindow: number; costUSD: number }> | undefined;
+            const cost = msg.total_cost_usd as number | undefined;
+            if (usage || modelUsage || cost != null) {
+              onEvent({
+                type: 'result_usage',
+                usage,
+                modelUsage,
+                totalCostUsd: cost,
+              } as StreamEvent);
             }
           } else {
             const errors = (msg.errors as string[]) || [];

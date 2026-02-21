@@ -279,7 +279,25 @@ impl Service for SessionService {
             }
 
             "session/loadLast" => {
+                let p: LoadLastParam = parse_params_optional(params);
                 let sessions_dir = self.sessions_dir.read().clone();
+
+                // If a workspace root is provided, load that workspace's
+                // specific session file directly (deterministic filename).
+                if let Some(ref ws_root) = p.workspace_root {
+                    let id = format!("workspace-{:x}", simple_hash(ws_root));
+                    let path = sessions_dir.join(format!("{id}.json"));
+                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                        if let Ok(state) = serde_json::from_str::<SessionState>(&content) {
+                            *self.current_session.write() = Some(state.clone());
+                            return Ok(serde_json::to_value(&state).unwrap_or(Value::Null));
+                        }
+                    }
+                    // No saved state for this workspace — return null
+                    return Ok(Value::Null);
+                }
+
+                // Fallback: no workspace specified — pick newest file (legacy behavior)
                 let mut newest: Option<(u64, String)> = None;
 
                 if let Ok(mut entries) = tokio::fs::read_dir(&sessions_dir).await {
@@ -474,6 +492,12 @@ struct ConfigResetParam { key: Option<String> }
 
 #[derive(Deserialize, Default)]
 struct SessionSaveParams { name: Option<String> }
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LoadLastParam {
+    workspace_root: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct SessionLoadParam {

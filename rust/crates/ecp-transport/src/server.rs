@@ -3,7 +3,6 @@
 //! Handles HTTP upgrade to WebSocket, authentication handshake,
 //! heartbeat pings, and message routing to the ECP server.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +64,13 @@ pub trait RequestHandler: Send + Sync + 'static {
     }
 }
 
+/// TLS configuration for the transport server.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    pub cert_path: std::path::PathBuf,
+    pub key_path: std::path::PathBuf,
+}
+
 /// Transport server configuration.
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
@@ -82,6 +88,8 @@ pub struct TransportConfig {
     pub workspace_root: Option<String>,
     /// Enable verbose connection logging
     pub verbose_logging: bool,
+    /// TLS configuration (None = plain TCP)
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for TransportConfig {
@@ -94,6 +102,7 @@ impl Default for TransportConfig {
             max_connections: Some(32),
             workspace_root: None,
             verbose_logging: false,
+            tls: None,
         }
     }
 }
@@ -118,6 +127,8 @@ pub struct TransportServer {
     handle: Option<tokio::task::JoinHandle<()>>,
     /// Actual bound port
     port: u16,
+    /// Whether TLS is enabled
+    tls_enabled: bool,
 }
 
 impl TransportServer {
@@ -154,26 +165,72 @@ impl TransportServer {
             .route("/health", get(health_handler::<H>))
             .with_state(state);
 
-        let addr: SocketAddr = format!("{}:{}", config.hostname, config.port).parse()?;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        let actual_port = listener.local_addr()?.port();
+        let tls_enabled = config.tls.is_some();
 
-        info!("ECP transport listening on ws://{}:{}/ws", config.hostname, actual_port);
+        let (handle, actual_port) = if let Some(ref tls) = config.tls {
+            // TLS path — use axum_server with rustls
+            let bind_addr = format!("{}:{}", config.hostname, config.port);
+            let addr: std::net::SocketAddr = tokio::net::lookup_host(&bind_addr)
+                .await?
+                .next()
+                .ok_or("Failed to resolve bind address")?;
 
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.recv().await;
-                })
-                .await
-                .ok();
-        });
+            let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                &tls.cert_path,
+                &tls.key_path,
+            ).await?;
+
+            let axum_handle = axum_server::Handle::new();
+            let handle_clone = axum_handle.clone();
+
+            let server_handle = tokio::spawn(async move {
+                axum_server::bind_rustls(addr, rustls_config)
+                    .handle(handle_clone)
+                    .serve(app.into_make_service())
+                    .await
+                    .ok();
+            });
+
+            // Wait for the server to start listening (resolves port 0)
+            let actual_addr = axum_handle.listening().await
+                .ok_or("TLS server failed to start listening")?;
+            let actual_port = actual_addr.port();
+
+            info!("ECP transport listening on wss://{}:{}/ws", config.hostname, actual_port);
+
+            // Wire shutdown
+            tokio::spawn(async move {
+                let _ = shutdown_rx.recv().await;
+                axum_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+            });
+
+            (server_handle, actual_port)
+        } else {
+            // Plain TCP path
+            let bind_addr = format!("{}:{}", config.hostname, config.port);
+            let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+            let actual_port = listener.local_addr()?.port();
+
+            info!("ECP transport listening on ws://{}:{}/ws", config.hostname, actual_port);
+
+            let handle = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.recv().await;
+                    })
+                    .await
+                    .ok();
+            });
+
+            (handle, actual_port)
+        };
 
         Ok(Self {
             notification_tx,
             shutdown_tx: Some(shutdown_tx),
             handle: Some(handle),
             port: actual_port,
+            tls_enabled,
         })
     }
 
@@ -193,6 +250,11 @@ impl TransportServer {
     /// Get the actual bound port.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Whether TLS is enabled.
+    pub fn is_tls(&self) -> bool {
+        self.tls_enabled
     }
 
     /// Gracefully stop the server.

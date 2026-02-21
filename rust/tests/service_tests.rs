@@ -766,6 +766,42 @@ mod chat {
     }
 
     #[tokio::test]
+    async fn session_cli_session_id() {
+        let (_tmp, s) = svc();
+
+        // Create session with cliSessionId
+        let sess = s.handle("chat/session/create", Some(json!({
+            "title": "SDK Session",
+            "provider": "agent-sdk",
+            "cliSessionId": "sdk-abc-123",
+        }))).await.unwrap();
+        let sid = sess["id"].as_str().unwrap();
+
+        // Verify cliSessionId is returned on get
+        let result = s.handle("chat/session/get", Some(json!({"sessionId": sid}))).await.unwrap();
+        assert_eq!(result["session"]["cliSessionId"], "sdk-abc-123");
+        assert_eq!(result["session"]["provider"], "agent-sdk");
+
+        // Update cliSessionId
+        s.handle("chat/session/update", Some(json!({
+            "sessionId": sid,
+            "cliSessionId": "sdk-def-456",
+        }))).await.unwrap();
+
+        let result = s.handle("chat/session/get", Some(json!({"sessionId": sid}))).await.unwrap();
+        assert_eq!(result["session"]["cliSessionId"], "sdk-def-456");
+        assert_eq!(result["session"]["title"], "SDK Session"); // unchanged
+
+        // Create session without cliSessionId — should be null
+        let sess2 = s.handle("chat/session/create", Some(json!({
+            "title": "Normal Session",
+        }))).await.unwrap();
+        let sid2 = sess2["id"].as_str().unwrap();
+        let result2 = s.handle("chat/session/get", Some(json!({"sessionId": sid2}))).await.unwrap();
+        assert!(result2["session"]["cliSessionId"].is_null());
+    }
+
+    #[tokio::test]
     async fn message_crud() {
         let (_tmp, s) = svc();
         let sess = s.handle("chat/session/create", Some(json!({"title": "Msg Test"}))).await.unwrap();

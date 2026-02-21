@@ -65,6 +65,7 @@ async fn start_test_server_with_services() -> (u16, String) {
         max_connections: Some(16),
         workspace_root: Some(workspace_path.to_string_lossy().to_string()),
         verbose_logging: false,
+        tls: None,
     };
 
     let transport = TransportServer::start(config, ecp_server).await.unwrap();
@@ -560,6 +561,7 @@ async fn start_test_server_no_workspace() -> (u16, String) {
         max_connections: Some(16),
         workspace_root: None,
         verbose_logging: false,
+        tls: None,
     };
 
     let transport = TransportServer::start(config, ecp_server).await.unwrap();

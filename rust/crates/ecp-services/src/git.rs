@@ -204,7 +204,39 @@ impl Service for GitService {
                     args.push(path);
                 }
                 let diff = self.git(&args).await?;
-                let hunks = parse_diff(&diff);
+                let mut hunks = parse_diff(&diff);
+
+                // For untracked files, `git diff` returns empty output.
+                // Synthesize a diff showing the entire file as added lines.
+                if hunks.is_empty() {
+                    if let Some(ref path) = p.path {
+                        let cwd = self.workspace_root.read().clone();
+                        let file_path = cwd.join(path);
+                        if let Ok(content) = tokio::fs::read_to_string(&file_path).await {
+                            let file_lines: Vec<&str> = content.lines().collect();
+                            let count = file_lines.len() as u32;
+                            if count > 0 {
+                                let lines: Vec<serde_json::Value> = file_lines
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, l)| json!({
+                                        "type": "+",
+                                        "content": *l,
+                                        "newLineNum": (i as u32) + 1,
+                                    }))
+                                    .collect();
+                                hunks.push(json!({
+                                    "oldStart": 0,
+                                    "oldCount": 0,
+                                    "newStart": 1,
+                                    "newCount": count,
+                                    "lines": lines,
+                                }));
+                            }
+                        }
+                    }
+                }
+
                 Ok(json!({ "hunks": hunks }))
             }
 
@@ -701,7 +733,7 @@ fn parse_params_optional<T: for<'de> Deserialize<'de> + Default>(params: Option<
         .unwrap_or_default()
 }
 
-/// Parse a unified diff into structured hunks.
+/// Parse a unified diff into structured hunks with line numbers.
 fn parse_diff(diff_text: &str) -> Vec<serde_json::Value> {
     let mut hunks = Vec::new();
     let mut current_lines: Vec<serde_json::Value> = Vec::new();
@@ -709,6 +741,8 @@ fn parse_diff(diff_text: &str) -> Vec<serde_json::Value> {
     let mut old_count = 0u32;
     let mut new_start = 0u32;
     let mut new_count = 0u32;
+    let mut old_line = 0u32;
+    let mut new_line = 0u32;
     let mut in_hunk = false;
 
     for line in diff_text.lines() {
@@ -738,14 +772,20 @@ fn parse_diff(diff_text: &str) -> Vec<serde_json::Value> {
                     new_count = new_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
                 }
             }
+            old_line = old_start;
+            new_line = new_start;
             in_hunk = true;
         } else if in_hunk {
             if line.starts_with('+') {
-                current_lines.push(json!({ "type": "+", "content": &line[1..] }));
+                current_lines.push(json!({ "type": "+", "content": &line[1..], "newLineNum": new_line }));
+                new_line += 1;
             } else if line.starts_with('-') {
-                current_lines.push(json!({ "type": "-", "content": &line[1..] }));
+                current_lines.push(json!({ "type": "-", "content": &line[1..], "oldLineNum": old_line }));
+                old_line += 1;
             } else if line.starts_with(' ') {
-                current_lines.push(json!({ "type": " ", "content": &line[1..] }));
+                current_lines.push(json!({ "type": " ", "content": &line[1..], "oldLineNum": old_line, "newLineNum": new_line }));
+                old_line += 1;
+                new_line += 1;
             }
         }
     }
