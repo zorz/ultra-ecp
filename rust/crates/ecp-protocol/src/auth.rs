@@ -62,6 +62,9 @@ pub struct HandshakeResult {
     /// Workspace root path
     #[serde(rename = "workspaceRoot", skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
+    /// SHA-256 fingerprint of the TLS certificate ("sha256:<hex>")
+    #[serde(rename = "certFingerprint", skip_serializing_if = "Option::is_none")]
+    pub cert_fingerprint: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

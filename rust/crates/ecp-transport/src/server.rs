@@ -90,6 +90,8 @@ pub struct TransportConfig {
     pub verbose_logging: bool,
     /// TLS configuration (None = plain TCP)
     pub tls: Option<TlsConfig>,
+    /// SHA-256 fingerprint of the TLS certificate
+    pub cert_fingerprint: Option<String>,
 }
 
 impl Default for TransportConfig {
@@ -103,6 +105,7 @@ impl Default for TransportConfig {
             workspace_root: None,
             verbose_logging: false,
             tls: None,
+            cert_fingerprint: None,
         }
     }
 }
@@ -561,6 +564,7 @@ fn handle_handshake(
                 session_id: uuid::Uuid::new_v4().to_string(),
                 server_version: "0.1.0".into(),
                 workspace_root: config.workspace_root.clone(),
+                cert_fingerprint: config.cert_fingerprint.clone(),
             };
             let resp = ECPResponse::success(
                 id.unwrap_or(RequestId::Number(0)),
@@ -577,6 +581,7 @@ fn handle_handshake(
                 session_id: uuid::Uuid::new_v4().to_string(),
                 server_version: "0.1.0".into(),
                 workspace_root: config.workspace_root.clone(),
+                cert_fingerprint: config.cert_fingerprint.clone(),
             };
             let resp = ECPResponse::success(
                 id.unwrap_or(RequestId::Number(0)),

@@ -290,6 +290,7 @@ mod tests {
             session_id: "sess-1".into(),
             server_version: "0.1.0".into(),
             workspace_root: Some("/home/user/project".into()),
+            cert_fingerprint: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["clientId"], "client-1");

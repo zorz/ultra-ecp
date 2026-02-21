@@ -117,9 +117,25 @@ fn resolve_bun_path() -> String {
     "bun".to_string()
 }
 
+/// Compute SHA-256 fingerprint from a PEM certificate file.
+/// Returns `"sha256:<hex>"` or None if parsing fails.
+fn compute_cert_fingerprint_from_pem(cert_path: &std::path::Path) -> Option<String> {
+    use base64::Engine;
+    use sha2::{Sha256, Digest};
+
+    let pem_bytes = std::fs::read_to_string(cert_path).ok()?;
+    let b64: String = pem_bytes
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect();
+    let der = base64::engine::general_purpose::STANDARD.decode(&b64).ok()?;
+    let hash = Sha256::digest(&der);
+    Some(format!("sha256:{}", hex::encode(hash)))
+}
+
 /// Ensure TLS certificate and key exist at `~/.ultra/tls/`, generating if needed.
-/// Returns (cert_path, key_path).
-fn ensure_tls_certs() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+/// Returns (cert_path, key_path, fingerprint).
+fn ensure_tls_certs() -> Result<(PathBuf, PathBuf, String), Box<dyn std::error::Error>> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let tls_dir = PathBuf::from(&home).join(".ultra/tls");
     let cert_path = tls_dir.join("cert.pem");
@@ -127,7 +143,9 @@ fn ensure_tls_certs() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> 
 
     // Reuse existing certs if they exist
     if cert_path.exists() && key_path.exists() {
-        return Ok((cert_path, key_path));
+        let fingerprint = compute_cert_fingerprint_from_pem(&cert_path)
+            .unwrap_or_default();
+        return Ok((cert_path, key_path, fingerprint));
     }
 
     std::fs::create_dir_all(&tls_dir)?;
@@ -159,10 +177,17 @@ fn ensure_tls_certs() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> 
     let key_pair = rcgen::KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
 
+    // Compute fingerprint from DER directly (more reliable than re-parsing PEM)
+    let fingerprint = {
+        use sha2::{Sha256, Digest};
+        let hash = Sha256::digest(cert.der());
+        format!("sha256:{}", hex::encode(hash))
+    };
+
     std::fs::write(&cert_path, cert.pem())?;
     std::fs::write(&key_path, key_pair.serialize_pem())?;
 
-    Ok((cert_path, key_path))
+    Ok((cert_path, key_path, fingerprint))
 }
 
 #[tokio::main]
@@ -214,28 +239,63 @@ async fn main() {
         w
     });
 
-    // Generate auth token
+    // Resolve auth token — reuse persisted token, or generate and persist a new one.
+    // The --token CLI flag overrides (and does NOT update the persisted file).
+    let token_was_explicit = cli.token.is_some();
     let auth_token = cli.token.unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let token_path = PathBuf::from(&home).join(".ultra/auth-token");
+
+        // Reuse existing token if valid
+        if let Ok(existing) = std::fs::read_to_string(&token_path) {
+            let trimmed = existing.trim().to_string();
+            if trimmed.len() >= 32 {
+                return trimmed;
+            }
+        }
+
+        // Generate new persistent token
         use rand::Rng;
         let mut rng = rand::rng();
         let bytes: [u8; 32] = rng.random();
-        hex::encode(bytes)
+        let token = hex::encode(bytes);
+
+        // Persist it
+        let ultra_dir = PathBuf::from(&home).join(".ultra");
+        let _ = std::fs::create_dir_all(&ultra_dir);
+        let _ = std::fs::write(&token_path, &token);
+
+        // Restrict file permissions (owner-only read/write)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &token_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+
+        token
     });
 
-    // Resolve TLS configuration
-    let tls_config = if cli.no_tls {
-        None
+    // Resolve TLS configuration and cert fingerprint
+    let (tls_config, cert_fingerprint) = if cli.no_tls {
+        (None, None)
     } else if let (Some(cert), Some(key)) = (&cli.tls_cert, &cli.tls_key) {
-        Some(TlsConfig {
+        let fp = compute_cert_fingerprint_from_pem(cert);
+        (Some(TlsConfig {
             cert_path: cert.clone(),
             key_path: key.clone(),
-        })
+        }), fp)
     } else {
         match ensure_tls_certs() {
-            Ok((cert_path, key_path)) => Some(TlsConfig { cert_path, key_path }),
+            Ok((cert_path, key_path, fingerprint)) => (
+                Some(TlsConfig { cert_path, key_path }),
+                if fingerprint.is_empty() { None } else { Some(fingerprint) },
+            ),
             Err(e) => {
                 warn!("Failed to generate TLS certs, falling back to plain TCP: {e}");
-                None
+                (None, None)
             }
         }
     };
@@ -412,6 +472,7 @@ async fn main() {
         workspace_root: workspace_root.as_ref().map(|w| w.to_string_lossy().to_string()),
         verbose_logging: cli.verbose,
         tls: tls_config,
+        cert_fingerprint: cert_fingerprint.clone(),
     };
 
     // Start transport server with the shared notification channel and Arc<ECPServer>
@@ -427,6 +488,35 @@ async fn main() {
     let scheme = if transport.is_tls() { "wss" } else { "ws" };
     let ws_url = format!("{scheme}://{}:{}/ws", cli.hostname, actual_port);
 
+    // Write connection info file for client discovery
+    let server_json_path = PathBuf::from(&home).join(".ultra/server.json");
+    {
+        let server_info = serde_json::json!({
+            "host": cli.hostname,
+            "port": actual_port,
+            "scheme": scheme,
+            "token": auth_token,
+            "certFingerprint": cert_fingerprint,
+            "serverVersion": env!("CARGO_PKG_VERSION"),
+            "startedAt": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            "pid": std::process::id(),
+        });
+        if let Ok(json_str) = serde_json::to_string_pretty(&server_info) {
+            let _ = std::fs::write(&server_json_path, &json_str);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &server_json_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+        }
+    }
+
     println!("────────────────────────────────────────────────────────────────");
     println!();
     println!("  Server running!");
@@ -440,17 +530,53 @@ async fn main() {
     } else {
         println!("    {}", &auth_token);
     }
+    if !token_was_explicit {
+        println!("    (persisted to ~/.ultra/auth-token)");
+    }
+    println!();
+    println!("  Connection info:");
+    println!("    ~/.ultra/server.json");
     println!();
     println!("────────────────────────────────────────────────────────────────");
     println!();
     println!("  Press Ctrl+C to stop.");
     println!();
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
+    // Wait for shutdown signal: Ctrl+C or stdin EOF (parent process died).
+    // The Mac app passes a Pipe() as stdin — when the GUI is killed, the pipe
+    // closes and we detect EOF here, preventing orphaned server processes.
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    {
+        let notify = shutdown_notify.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 1];
+            loop {
+                match std::io::stdin().read(&mut buf) {
+                    Ok(0) | Err(_) => {
+                        // EOF — parent process is gone
+                        notify.notify_one();
+                        return;
+                    }
+                    Ok(_) => continue,
+                }
+            }
+        });
+    }
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = shutdown_notify.notified() => {
+            eprintln!("stdin closed (parent process gone) — shutting down");
+        }
+    }
 
     println!();
     println!("  Shutting down...");
     transport.stop().await;
+
+    // Clean up server.json on graceful shutdown
+    let _ = std::fs::remove_file(&server_json_path);
+
     println!("  Server stopped.");
 }

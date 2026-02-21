@@ -11,6 +11,18 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+/// Path to the compiled binary under test.
+fn binary_path() -> std::path::PathBuf {
+    // cargo test builds into target/debug/deps; the binary is at target/debug/ultra-ecp
+    let mut path = std::env::current_exe().unwrap();
+    path.pop(); // remove test binary name
+    if path.ends_with("deps") {
+        path.pop(); // leave target/debug
+    }
+    path.push("ultra-ecp");
+    path
+}
+
 /// Start a test server on a random port with a pre-opened default workspace.
 async fn start_test_server() -> (u16, String) {
     start_test_server_with_services().await
@@ -66,6 +78,7 @@ async fn start_test_server_with_services() -> (u16, String) {
         workspace_root: Some(workspace_path.to_string_lossy().to_string()),
         verbose_logging: false,
         tls: None,
+        cert_fingerprint: None,
     };
 
     let transport = TransportServer::start(config, ecp_server).await.unwrap();
@@ -136,7 +149,8 @@ async fn connect_and_auth(
     ws
 }
 
-/// Send a JSON-RPC request and read the response.
+/// Send a JSON-RPC request and read the response, skipping any interleaved
+/// notifications (messages without an `id` field).
 async fn send_request(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     id: i64,
@@ -153,14 +167,23 @@ async fn send_request(
     }
     ws.send(Message::Text(serde_json::to_string(&req).unwrap().into())).await.unwrap();
 
-    let msg = timeout(Duration::from_secs(10), ws.next())
-        .await
-        .expect("Timeout waiting for response")
-        .expect("Stream ended")
-        .expect("WebSocket error");
+    // Loop until we get a response (has "id"), skipping notifications
+    loop {
+        let msg = timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("Timeout waiting for response")
+            .expect("Stream ended")
+            .expect("WebSocket error");
 
-    let text = msg.into_text().unwrap();
-    serde_json::from_str(&text).unwrap()
+        let text = msg.into_text().unwrap();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+
+        // Notifications have "method" but no "id"; responses have "id"
+        if parsed.get("id").is_some() {
+            return parsed;
+        }
+        // Otherwise it's a notification — skip it and read the next message
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -562,6 +585,7 @@ async fn start_test_server_no_workspace() -> (u16, String) {
         workspace_root: None,
         verbose_logging: false,
         tls: None,
+        cert_fingerprint: None,
     };
 
     let transport = TransportServer::start(config, ecp_server).await.unwrap();
@@ -631,4 +655,83 @@ async fn global_services_work_without_workspace() {
         "languageId": "rust",
     }))).await;
     assert!(resp.get("result").is_some(), "Global document/open should work: {resp}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Binary-level tests (run the actual ultra-ecp binary as a subprocess)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn server_writes_server_json_and_auth_token() {
+    let bin = binary_path();
+    if !bin.exists() {
+        panic!("Binary not found at {}", bin.display());
+    }
+
+    // Use a temp directory as HOME so we don't touch the real ~/.ultra/
+    let fake_home = TempDir::new().unwrap();
+    let ultra_dir = fake_home.path().join(".ultra");
+    std::fs::create_dir_all(&ultra_dir).unwrap();
+
+    let mut child = std::process::Command::new(&bin)
+        .args(["--no-bridge", "--no-tls", "--port", "0"])
+        .env("HOME", fake_home.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("Failed to spawn ultra-ecp");
+
+    // Wait for the server to start and write its files
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Verify auth-token was created
+    let token_path = ultra_dir.join("auth-token");
+    assert!(token_path.exists(), "auth-token file should exist");
+    let token = std::fs::read_to_string(&token_path).unwrap();
+    let token = token.trim();
+    assert!(token.len() >= 32, "auth token should be at least 32 chars, got {}", token.len());
+
+    // Verify server.json was created
+    let server_json_path = ultra_dir.join("server.json");
+    assert!(server_json_path.exists(), "server.json should exist");
+
+    let server_json: Value = serde_json::from_str(
+        &std::fs::read_to_string(&server_json_path).unwrap()
+    ).unwrap();
+
+    // Verify server.json shape
+    assert_eq!(server_json["host"], "127.0.0.1");
+    assert!(server_json["port"].as_u64().unwrap() > 0, "port should be non-zero");
+    assert_eq!(server_json["scheme"], "ws"); // --no-tls
+    assert_eq!(server_json["token"].as_str().unwrap(), token);
+    assert!(server_json["certFingerprint"].is_null()); // no TLS
+    assert!(server_json["serverVersion"].is_string());
+    assert!(server_json["startedAt"].as_u64().unwrap() > 0);
+    assert_eq!(server_json["pid"].as_u64().unwrap(), child.id() as u64);
+
+    // Verify file permissions are 0600
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let token_mode = std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(token_mode, 0o600, "auth-token should be 0600, got {:o}", token_mode);
+        let json_mode = std::fs::metadata(&server_json_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(json_mode, 0o600, "server.json should be 0600, got {:o}", json_mode);
+    }
+
+    // Drop stdin to trigger graceful shutdown (stdin EOF)
+    drop(child.stdin.take());
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::task::spawn_blocking(move || child.wait())
+            .await
+            .unwrap()
+    }).await;
+    assert!(status.is_ok(), "Server should exit after stdin EOF");
+
+    // Verify server.json is cleaned up on shutdown
+    assert!(!server_json_path.exists(), "server.json should be removed after shutdown");
+
+    // Verify auth-token persists (not cleaned up)
+    assert!(token_path.exists(), "auth-token should persist after shutdown");
 }
