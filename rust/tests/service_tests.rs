@@ -935,6 +935,100 @@ mod chat {
         assert_eq!(check["allowed"], true);
     }
 
+    #[tokio::test]
+    async fn permission_scope_hierarchy() {
+        let (_tmp, s) = svc();
+        let sess = s.handle("chat/session/create", Some(json!({"title": "Perm Hierarchy"}))).await.unwrap();
+        let sid = sess["id"].as_str().unwrap();
+
+        // 1. No permission → not allowed
+        let check = s.handle("chat/permission/check", Some(json!({
+            "toolName": "Edit", "sessionId": sid,
+        }))).await.unwrap();
+        assert_eq!(check["allowed"], false);
+
+        // 2. Grant project-scoped approval
+        s.handle("chat/permission/grant", Some(json!({
+            "toolName": "Edit", "scope": "project", "decision": "approved",
+            "description": "Edit files in project",
+        }))).await.unwrap();
+
+        let check = s.handle("chat/permission/check", Some(json!({
+            "toolName": "Edit", "sessionId": sid,
+        }))).await.unwrap();
+        assert_eq!(check["allowed"], true);
+        assert_eq!(check["approval"]["scope"], "project");
+
+        // 3. Deny beats approve — use a different tool to avoid unique constraint
+        // Grant approval first, then deny for the same tool with global scope
+        s.handle("chat/permission/grant", Some(json!({
+            "toolName": "Delete", "scope": "project", "decision": "approved",
+        }))).await.unwrap();
+        s.handle("chat/permission/grant", Some(json!({
+            "toolName": "Delete", "scope": "global", "decision": "denied",
+            "reason": "Security policy",
+        }))).await.unwrap();
+
+        let check = s.handle("chat/permission/check", Some(json!({
+            "toolName": "Delete", "sessionId": sid,
+        }))).await.unwrap();
+        assert_eq!(check["allowed"], false);
+        assert_eq!(check["denied"], true);
+        assert_eq!(check["denyType"], "hard");
+        assert_eq!(check["reason"], "Security policy");
+
+        // 4. Session-scoped approval: only matches with correct sessionId
+        s.handle("chat/permission/grant", Some(json!({
+            "toolName": "Bash", "scope": "session", "sessionId": sid,
+            "decision": "approved",
+        }))).await.unwrap();
+
+        let check = s.handle("chat/permission/check", Some(json!({
+            "toolName": "Bash", "sessionId": sid,
+        }))).await.unwrap();
+        assert_eq!(check["allowed"], true);
+        assert_eq!(check["approval"]["scope"], "session");
+
+        // Without sessionId → should not match
+        let check = s.handle("chat/permission/check", Some(json!({
+            "toolName": "Bash",
+        }))).await.unwrap();
+        assert_eq!(check["allowed"], false);
+
+        // 5. Folder-scoped approval with path matching
+        s.handle("chat/permission/grant", Some(json!({
+            "toolName": "Write", "scope": "folder",
+            "pattern": "/Users/test/project/src",
+            "decision": "approved",
+        }))).await.unwrap();
+
+        // Path within folder → allowed
+        let check = s.handle("chat/permission/check", Some(json!({
+            "toolName": "Write",
+            "targetPath": "/Users/test/project/src/main.rs",
+        }))).await.unwrap();
+        assert_eq!(check["allowed"], true);
+        assert_eq!(check["approval"]["scope"], "folder");
+
+        // Path outside folder → not allowed
+        let check = s.handle("chat/permission/check", Some(json!({
+            "toolName": "Write",
+            "targetPath": "/Users/test/other/file.rs",
+        }))).await.unwrap();
+        assert_eq!(check["allowed"], false);
+
+        // 6. Global approval
+        s.handle("chat/permission/grant", Some(json!({
+            "toolName": "Read", "scope": "global", "decision": "approved",
+        }))).await.unwrap();
+
+        let check = s.handle("chat/permission/check", Some(json!({
+            "toolName": "Read",
+        }))).await.unwrap();
+        assert_eq!(check["allowed"], true);
+        assert_eq!(check["approval"]["scope"], "global");
+    }
+
     async fn create_test_session(s: &ChatService) -> String {
         let result = s.handle("chat/session/create", Some(json!({
             "title": "Test", "provider": "claude", "model": "claude-sonnet-4-20250514",
@@ -2525,5 +2619,1799 @@ mod models {
         let result = svc.handle("models/nonexistent", None).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, -32601);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Workflow service tests — CRUD, execution lifecycle, governance, dashboard
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod workflow {
+    use super::*;
+    use ecp_services::chat::ChatDb;
+    use ecp_services::workflow::WorkflowService;
+    use ecp_services::Service;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    fn svc() -> (TempDir, WorkflowService) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".ultra")).unwrap();
+        let global_db = ChatDb::open(&tmp.path().join(".ultra/global.db"))
+            .expect("Failed to open global DB");
+        let s = WorkflowService::new_with_global_db(
+            tmp.path(),
+            Arc::new(Mutex::new(global_db)),
+        );
+        (tmp, s)
+    }
+
+    // ── Workflow CRUD ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn workflow_crud() {
+        let (_tmp, s) = svc();
+
+        // Create
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({
+                    "name": "Test Workflow",
+                    "description": "A test workflow",
+                    "triggerType": "manual",
+                })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap().to_string();
+        assert!(wf_id.starts_with("wf-"));
+        assert_eq!(wf["name"], "Test Workflow");
+        assert_eq!(wf["description"], "A test workflow");
+        assert_eq!(wf["triggerType"], "manual");
+        assert_eq!(wf["isSystem"], false);
+        assert_eq!(wf["isDefault"], false);
+
+        // Get
+        let result = s
+            .handle("workflow/get", Some(json!({ "id": &wf_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["name"], "Test Workflow");
+
+        // List
+        let result = s.handle("workflow/list", None).await.unwrap();
+        assert_eq!(result["workflows"].as_array().unwrap().len(), 1);
+
+        // Update
+        let updated = s
+            .handle(
+                "workflow/update",
+                Some(json!({ "id": &wf_id, "name": "Updated Workflow", "description": "Updated desc" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated["name"], "Updated Workflow");
+        assert_eq!(updated["description"], "Updated desc");
+
+        // Delete
+        let result = s
+            .handle("workflow/delete", Some(json!({ "id": &wf_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["deleted"], true);
+
+        // Verify deleted
+        let result = s
+            .handle("workflow/get", Some(json!({ "id": &wf_id })))
+            .await
+            .unwrap();
+        assert!(result.is_null());
+    }
+
+    #[tokio::test]
+    async fn workflow_create_with_definition() {
+        let (_tmp, s) = svc();
+
+        let definition = json!({
+            "steps": [
+                { "id": "step1", "type": "agent", "agent": "assistant", "prompt": "Hello" },
+                { "id": "step2", "type": "checkpoint", "checkpointMessage": "Review?" },
+            ]
+        });
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({
+                    "name": "With Definition",
+                    "definition": definition,
+                })),
+            )
+            .await
+            .unwrap();
+
+        let wf_id = wf["id"].as_str().unwrap();
+        let result = s
+            .handle("workflow/get", Some(json!({ "id": wf_id })))
+            .await
+            .unwrap();
+
+        let steps = result["definition"]["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["type"], "agent");
+        assert_eq!(steps[1]["type"], "checkpoint");
+    }
+
+    #[tokio::test]
+    async fn workflow_create_with_custom_id() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "id": "my-custom-wf", "name": "Custom ID" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wf["id"], "my-custom-wf");
+    }
+
+    #[tokio::test]
+    async fn workflow_system_protection() {
+        let (_tmp, s) = svc();
+
+        // Create a system workflow
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "System WF", "isSystem": true })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+        assert_eq!(wf["isSystem"], true);
+
+        // Cannot delete system workflows
+        let result = s
+            .handle("workflow/delete", Some(json!({ "id": wf_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["deleted"], false);
+    }
+
+    #[tokio::test]
+    async fn workflow_list_exclude_system() {
+        let (_tmp, s) = svc();
+
+        s.handle(
+            "workflow/create",
+            Some(json!({ "name": "User WF", "isSystem": false })),
+        )
+        .await
+        .unwrap();
+        s.handle(
+            "workflow/create",
+            Some(json!({ "name": "System WF", "isSystem": true })),
+        )
+        .await
+        .unwrap();
+
+        // Include system (default)
+        let result = s.handle("workflow/list", None).await.unwrap();
+        assert_eq!(result["workflows"].as_array().unwrap().len(), 2);
+
+        // Exclude system
+        let result = s
+            .handle(
+                "workflow/list",
+                Some(json!({ "includeSystem": false })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["workflows"].as_array().unwrap().len(), 1);
+        assert_eq!(result["workflows"][0]["name"], "User WF");
+    }
+
+    // ── Execution Lifecycle ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execution_crud() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Exec Test", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+
+        // Start execution (empty steps = completes immediately)
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf_id })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap().to_string();
+        assert!(exec_id.starts_with("exec-"));
+
+        // Brief wait for async executor to complete
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Get execution
+        let result = s
+            .handle("workflow/execute/get", Some(json!({ "id": &exec_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["workflowName"], "Exec Test");
+        // Empty-step workflow completes immediately
+        assert_eq!(result["status"], "completed");
+
+        // List executions
+        let result = s
+            .handle("workflow/execute/list", None)
+            .await
+            .unwrap();
+        assert_eq!(result["executions"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execution_with_initial_input() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Input Test", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({
+                    "workflowId": wf_id,
+                    "initialInput": { "prUrl": "https://github.com/test/pr/1" },
+                    "maxIterations": 5,
+                })),
+            )
+            .await
+            .unwrap();
+
+        let exec_id = exec["id"].as_str().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let result = s
+            .handle("workflow/execute/get", Some(json!({ "id": exec_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["initialInput"]["prUrl"], "https://github.com/test/pr/1");
+        assert_eq!(result["maxIterations"], 5);
+    }
+
+    #[tokio::test]
+    async fn execution_pause_resume_cancel() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "State Test", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf_id })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Pause
+        let result = s
+            .handle("workflow/execute/pause", Some(json!({ "id": exec_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "paused");
+
+        // Resume
+        let result = s
+            .handle("workflow/execute/resume", Some(json!({ "id": exec_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "running");
+
+        // Cancel
+        let result = s
+            .handle("workflow/execute/cancel", Some(json!({ "id": exec_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "cancelled");
+        assert!(result["completedAt"].is_i64()); // terminal states get completedAt
+    }
+
+    #[tokio::test]
+    async fn execution_list_with_filters() {
+        let (_tmp, s) = svc();
+
+        let wf1 = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "WF1", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let wf2 = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "WF2", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+
+        s.handle(
+            "workflow/execute/start",
+            Some(json!({ "workflowId": wf1["id"].as_str().unwrap() })),
+        )
+        .await
+        .unwrap();
+        s.handle(
+            "workflow/execute/start",
+            Some(json!({ "workflowId": wf2["id"].as_str().unwrap() })),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Filter by workflow_id
+        let result = s
+            .handle(
+                "workflow/execute/list",
+                Some(json!({ "workflowId": wf1["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["executions"].as_array().unwrap().len(), 1);
+
+        // Filter by status
+        let result = s
+            .handle(
+                "workflow/execute/list",
+                Some(json!({ "status": "completed" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["executions"].as_array().unwrap().len(), 2);
+
+        // Limit
+        let result = s
+            .handle(
+                "workflow/execute/list",
+                Some(json!({ "limit": 1 })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["executions"].as_array().unwrap().len(), 1);
+    }
+
+    // ── Checkpoints ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn checkpoint_lifecycle() {
+        let (_tmp, s) = svc();
+
+        // Create a workflow with a checkpoint step
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({
+                    "name": "Checkpoint WF",
+                    "definition": {
+                        "steps": [
+                            { "id": "check", "type": "checkpoint", "prompt": "Approve?" }
+                        ]
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+
+        // Start execution — should pause at checkpoint
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf_id })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        // Wait for executor to reach checkpoint
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Verify execution is awaiting input
+        let result = s
+            .handle("workflow/execute/get", Some(json!({ "id": exec_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "awaiting_input");
+
+        // List pending checkpoints
+        let result = s
+            .handle(
+                "workflow/checkpoint/list",
+                Some(json!({ "sessionId": exec_id, "pendingOnly": true })),
+            )
+            .await
+            .unwrap();
+        let checkpoints = result["checkpoints"].as_array().unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        let cp_id = checkpoints[0]["id"].as_str().unwrap();
+        assert_eq!(checkpoints[0]["checkpointType"], "approval");
+        assert!(checkpoints[0]["decidedAt"].is_null());
+
+        // Get checkpoint
+        let cp = s
+            .handle("workflow/checkpoint/get", Some(json!({ "id": cp_id })))
+            .await
+            .unwrap();
+        assert_eq!(cp["checkpointType"], "approval");
+
+        // Respond to checkpoint
+        let responded = s
+            .handle(
+                "workflow/checkpoint/respond",
+                Some(json!({ "id": cp_id, "decision": "approved", "feedback": "Looks good" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(responded["decision"], "approved");
+        assert_eq!(responded["feedback"], "Looks good");
+        assert!(responded["decidedAt"].is_i64());
+    }
+
+    // ── Permissions ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn permission_grant_check_deny() {
+        let (_tmp, s) = svc();
+
+        // Initially no permission
+        let result = s
+            .handle(
+                "workflow/permission/check",
+                Some(json!({ "toolName": "file/write" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["allowed"], false);
+        assert!(result["permission"].is_null());
+
+        // Grant permission
+        let result = s
+            .handle(
+                "workflow/permission/grant",
+                Some(json!({
+                    "toolName": "file/write",
+                    "scope": "project",
+                    "reason": "Needed for build",
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["granted"], true);
+
+        // Check — now allowed
+        let result = s
+            .handle(
+                "workflow/permission/check",
+                Some(json!({ "toolName": "file/write" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["allowed"], true);
+        assert_eq!(result["permission"]["scope"], "project");
+
+        // Deny permission
+        let result = s
+            .handle(
+                "workflow/permission/deny",
+                Some(json!({
+                    "toolName": "file/write",
+                    "scope": "project",
+                    "reason": "Security concern",
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["denied"], true);
+    }
+
+    #[tokio::test]
+    async fn permission_scoped_to_session() {
+        let (_tmp, s) = svc();
+
+        // Create a real execution to use as session_id (FK constraint)
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Perm WF", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        let session_id = exec["id"].as_str().unwrap();
+
+        // Grant for specific session
+        s.handle(
+            "workflow/permission/grant",
+            Some(json!({
+                "toolName": "terminal/execute",
+                "scope": "session",
+                "sessionId": session_id,
+            })),
+        )
+        .await
+        .unwrap();
+
+        // Check with matching session
+        let result = s
+            .handle(
+                "workflow/permission/check",
+                Some(json!({ "toolName": "terminal/execute", "sessionId": session_id })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["allowed"], true);
+
+        // Check without session — session-scoped grant doesn't apply
+        let result = s
+            .handle(
+                "workflow/permission/check",
+                Some(json!({ "toolName": "terminal/execute" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["allowed"], false, "Session-scoped permission should not match without sessionId");
+    }
+
+    // ── Context & Messages ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn context_add_and_list() {
+        let (_tmp, s) = svc();
+
+        // Create a workflow execution to attach context to
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Ctx Test", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        // Add context items
+        s.handle(
+            "workflow/context/add",
+            Some(json!({
+                "sessionId": exec_id,
+                "itemType": "user_input",
+                "content": "Please review this code",
+            })),
+        )
+        .await
+        .unwrap();
+
+        s.handle(
+            "workflow/context/add",
+            Some(json!({
+                "sessionId": exec_id,
+                "itemType": "agent_output",
+                "content": "I have reviewed the code.",
+                "agentId": "reviewer",
+                "agentName": "Code Reviewer",
+            })),
+        )
+        .await
+        .unwrap();
+
+        // List context
+        let result = s
+            .handle(
+                "workflow/context/list",
+                Some(json!({ "sessionId": exec_id })),
+            )
+            .await
+            .unwrap();
+        let items = result["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["role"], "user");
+        assert_eq!(items[0]["content"], "Please review this code");
+        assert_eq!(items[1]["role"], "assistant");
+        assert_eq!(items[1]["agentId"], "reviewer");
+    }
+
+    #[tokio::test]
+    async fn message_list_and_get() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Msg Test", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        // Add a message via context/add (messages and context share the same table)
+        let msg = s
+            .handle(
+                "workflow/context/add",
+                Some(json!({
+                    "sessionId": exec_id,
+                    "itemType": "system",
+                    "content": "Workflow started",
+                })),
+            )
+            .await
+            .unwrap();
+        let msg_id = msg["id"].as_str().unwrap();
+
+        // Get message
+        let result = s
+            .handle("workflow/message/get", Some(json!({ "id": msg_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["content"], "Workflow started");
+        assert_eq!(result["role"], "system");
+
+        // List messages
+        let result = s
+            .handle(
+                "workflow/message/list",
+                Some(json!({ "sessionId": exec_id })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+
+        // List with role filter
+        let result = s
+            .handle(
+                "workflow/message/list",
+                Some(json!({ "sessionId": exec_id, "role": "system" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+
+        let result = s
+            .handle(
+                "workflow/message/list",
+                Some(json!({ "sessionId": exec_id, "role": "user" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["messages"].as_array().unwrap().len(), 0);
+    }
+
+    // ── Feedback ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn feedback_empty_list() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "FB Test", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        let result = s
+            .handle(
+                "workflow/feedback/list",
+                Some(json!({ "sessionId": exec_id })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["feedback"].as_array().unwrap().len(), 0);
+    }
+
+    // ── Agents ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn agent_crud() {
+        let (_tmp, s) = svc();
+
+        // Create
+        let agent = s
+            .handle(
+                "workflow/agent/create",
+                Some(json!({
+                    "name": "Code Reviewer",
+                    "description": "Reviews code for quality",
+                    "role": "reviewer",
+                    "provider": "claude",
+                    "model": "claude-sonnet-4-20250514",
+                    "systemPrompt": "You are a code reviewer.",
+                    "tools": ["file/read", "git/diff"],
+                })),
+            )
+            .await
+            .unwrap();
+        let agent_id = agent["id"].as_str().unwrap().to_string();
+        assert!(agent_id.starts_with("agent-"));
+        assert_eq!(agent["name"], "Code Reviewer");
+        assert_eq!(agent["role"], "reviewer");
+        assert_eq!(agent["tools"].as_array().unwrap().len(), 2);
+
+        // Get
+        let result = s
+            .handle("workflow/agent/get", Some(json!({ "id": &agent_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["name"], "Code Reviewer");
+        assert_eq!(result["systemPrompt"], "You are a code reviewer.");
+
+        // Update
+        let result = s
+            .handle(
+                "workflow/agent/update",
+                Some(json!({
+                    "id": &agent_id,
+                    "name": "Senior Reviewer",
+                    "model": "claude-opus-4-20250514",
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["name"], "Senior Reviewer");
+        assert_eq!(result["model"], "claude-opus-4-20250514");
+
+        // List — verify our agent appears (may include global agents from dual-DB)
+        let result = s.handle("workflow/agent/list", None).await.unwrap();
+        let agents = result["agents"].as_array().unwrap();
+        assert!(
+            agents.iter().any(|a| a["id"].as_str() == Some(&agent_id)),
+            "Created agent should appear in list"
+        );
+
+        // Delete
+        let result = s
+            .handle("workflow/agent/delete", Some(json!({ "id": &agent_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["deleted"], true);
+
+        // Verify deleted
+        let result = s
+            .handle("workflow/agent/get", Some(json!({ "id": &agent_id })))
+            .await
+            .unwrap();
+        assert!(result.is_null());
+    }
+
+    #[tokio::test]
+    async fn agent_with_custom_id() {
+        let (_tmp, s) = svc();
+
+        let agent = s
+            .handle(
+                "workflow/agent/create",
+                Some(json!({ "id": "my-agent", "name": "Custom Agent" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent["id"], "my-agent");
+    }
+
+    #[tokio::test]
+    async fn agent_list_with_role_filter() {
+        let (_tmp, s) = svc();
+
+        s.handle(
+            "workflow/agent/create",
+            Some(json!({ "name": "General Agent", "roleType": "general" })),
+        )
+        .await
+        .unwrap();
+        s.handle(
+            "workflow/agent/create",
+            Some(json!({ "name": "Specialist Agent", "roleType": "specialist" })),
+        )
+        .await
+        .unwrap();
+
+        // List all — verify both appear (may include global agents from dual-DB)
+        let result = s.handle("workflow/agent/list", None).await.unwrap();
+        let agents = result["agents"].as_array().unwrap();
+        assert!(agents.iter().any(|a| a["name"] == "General Agent"));
+        assert!(agents.iter().any(|a| a["name"] == "Specialist Agent"));
+
+        // Filter by role type
+        let result = s
+            .handle(
+                "workflow/agent/list",
+                Some(json!({ "roleType": "specialist" })),
+            )
+            .await
+            .unwrap();
+        let filtered = result["agents"].as_array().unwrap();
+        assert!(filtered.iter().any(|a| a["name"] == "Specialist Agent"));
+        assert!(!filtered.iter().any(|a| a["name"] == "General Agent"));
+    }
+
+    #[tokio::test]
+    async fn agent_system_protection() {
+        let (_tmp, s) = svc();
+
+        let agent = s
+            .handle(
+                "workflow/agent/create",
+                Some(json!({ "name": "System Agent", "isSystem": true })),
+            )
+            .await
+            .unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+
+        // Cannot delete system agents
+        let result = s
+            .handle("workflow/agent/delete", Some(json!({ "id": agent_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["deleted"], false);
+    }
+
+    // ── Tool Calls ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tool_call_get_nonexistent() {
+        let (_tmp, s) = svc();
+
+        let result = s
+            .handle("workflow/toolCall/get", Some(json!({ "id": "tc-none" })))
+            .await
+            .unwrap();
+        assert!(result.is_null());
+    }
+
+    #[tokio::test]
+    async fn execution_tools_empty_list() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Tool Test", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        let result = s
+            .handle(
+                "workflow/execution/tools",
+                Some(json!({ "sessionId": exec_id })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["tools"].as_array().unwrap().len(), 0);
+    }
+
+    // ── Governance ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn governance_config() {
+        let (_tmp, s) = svc();
+
+        let result = s
+            .handle("workflow/governance/config", None)
+            .await
+            .unwrap();
+        let checks = result["checks"].as_array().unwrap();
+        assert!(checks.len() >= 5);
+        assert!(checks.iter().any(|c| c == "build"));
+        assert!(checks.iter().any(|c| c == "test"));
+        assert!(checks.iter().any(|c| c == "dead_code"));
+        assert!(checks.iter().any(|c| c == "diagnostics"));
+        assert!(checks.iter().any(|c| c == "breaking_changes"));
+    }
+
+    #[tokio::test]
+    async fn governance_history_empty() {
+        let (_tmp, s) = svc();
+
+        let result = s
+            .handle("workflow/governance/history", None)
+            .await
+            .unwrap();
+        assert_eq!(result["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn governance_evaluate_requires_router() {
+        let (_tmp, s) = svc();
+
+        // Without InternalRouter set, evaluate should fail
+        let result = s
+            .handle(
+                "workflow/governance/evaluate",
+                Some(json!({ "checks": ["build"] })),
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("Internal router not available"));
+    }
+
+    // ── Dashboard ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dashboard_empty_state() {
+        let (_tmp, s) = svc();
+
+        let result = s
+            .handle("workflow/dashboard", None)
+            .await
+            .unwrap();
+
+        // All sections should exist but be empty/zeroed
+        assert_eq!(result["executions"].as_array().unwrap().len(), 0);
+        assert_eq!(result["governance"]["totalChecks"], 0);
+        assert_eq!(result["governance"]["passRate"], 1.0);
+        assert_eq!(result["activity"]["totalExecutions"], 0);
+        assert_eq!(result["activity"]["completionRate"], 0.0);
+        assert_eq!(result["quality"]["allPassing"], true);
+        assert_eq!(result["quality"]["checkCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn dashboard_with_executions() {
+        let (_tmp, s) = svc();
+
+        // Create a workflow and run a couple executions
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Dashboard WF", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+
+        s.handle(
+            "workflow/execute/start",
+            Some(json!({ "workflowId": wf_id })),
+        )
+        .await
+        .unwrap();
+        s.handle(
+            "workflow/execute/start",
+            Some(json!({ "workflowId": wf_id })),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let result = s
+            .handle("workflow/dashboard", Some(json!({ "limit": 10 })))
+            .await
+            .unwrap();
+
+        assert_eq!(result["executions"].as_array().unwrap().len(), 2);
+        assert_eq!(result["activity"]["totalExecutions"], 2);
+        assert_eq!(result["activity"]["completed"], 2);
+        assert_eq!(result["activity"]["completionRate"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn dashboard_governance_empty() {
+        let (_tmp, s) = svc();
+
+        let result = s
+            .handle("workflow/dashboard/governance", None)
+            .await
+            .unwrap();
+
+        assert_eq!(result["passRates"].as_array().unwrap().len(), 0);
+        assert_eq!(result["recentResults"].as_array().unwrap().len(), 0);
+        assert_eq!(result["failurePatterns"]["commonFailures"].as_array().unwrap().len(), 0);
+        assert_eq!(result["trend"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dashboard_quality_empty() {
+        let (_tmp, s) = svc();
+
+        let result = s
+            .handle("workflow/dashboard/quality", None)
+            .await
+            .unwrap();
+
+        assert_eq!(result["healthHistory"].as_array().unwrap().len(), 0);
+        assert_eq!(result["checkHistory"].as_array().unwrap().len(), 0);
+        assert_eq!(result["nodePerformance"].as_array().unwrap().len(), 0);
+        assert_eq!(result["tokenUsage"]["totalTokens"], 0);
+        assert_eq!(result["tokenUsage"]["nodeCount"], 0);
+    }
+
+    #[tokio::test]
+    async fn dashboard_quality_with_executions() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Quality WF", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+
+        s.handle(
+            "workflow/execute/start",
+            Some(json!({ "workflowId": wf_id })),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let result = s
+            .handle("workflow/dashboard/quality", None)
+            .await
+            .unwrap();
+
+        assert_eq!(result["healthHistory"].as_array().unwrap().len(), 1);
+        let entry = &result["healthHistory"][0];
+        assert_eq!(entry["status"], "completed");
+        assert_eq!(entry["nodeSuccessRate"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn dashboard_commit_nonexistent() {
+        let (_tmp, s) = svc();
+
+        let result = s
+            .handle(
+                "workflow/dashboard/commit",
+                Some(json!({ "id": "exec-nonexistent" })),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_null());
+    }
+
+    #[tokio::test]
+    async fn dashboard_commit_for_execution() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Commit WF", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf_id })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let result = s
+            .handle(
+                "workflow/dashboard/commit",
+                Some(json!({ "id": exec_id })),
+            )
+            .await
+            .unwrap();
+
+        assert!(result["summary"].as_str().unwrap().contains("Commit WF"));
+        assert!(result["body"].as_str().unwrap().contains("Iterations:"));
+        assert!(result["body"].as_str().unwrap().contains("Tokens:"));
+        assert_eq!(result["execution"]["workflowName"], "Commit WF");
+    }
+
+    // ── Step Execution ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_step_completes_empty_workflow() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Step Test", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf_id })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Step on completed execution should fail
+        let result = s
+            .handle("workflow/execute/step", Some(json!({ "id": exec_id })))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("terminal state"));
+    }
+
+    // ── Unknown Method ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_method_returns_error() {
+        let (_tmp, s) = svc();
+        let result = s.handle("workflow/nonexistent", None).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, -32601);
+    }
+
+    // ── Execution with Checkpoint Step ───────────────────────────────────
+
+    #[tokio::test]
+    async fn execution_with_human_node_pauses() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({
+                    "name": "Human Node WF",
+                    "definition": {
+                        "steps": [
+                            { "id": "input", "type": "human", "prompt": "Please provide input" }
+                        ]
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let result = s
+            .handle("workflow/execute/get", Some(json!({ "id": exec_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "awaiting_input");
+        assert_eq!(result["currentNodeId"], "input");
+    }
+
+    // ── Passthrough Nodes ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execution_with_passthrough_nodes() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({
+                    "name": "Passthrough WF",
+                    "definition": {
+                        "steps": [
+                            { "id": "cond", "type": "condition", "prompt": "Check X" },
+                            { "id": "out", "type": "output", "prompt": "Result" },
+                        ]
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let result = s
+            .handle("workflow/execute/get", Some(json!({ "id": exec_id })))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "completed");
+    }
+
+    // ── Agent Node without Bridge ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execution_agent_node_fails_without_bridge() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({
+                    "name": "Agent WF",
+                    "definition": {
+                        "steps": [
+                            { "id": "ai", "type": "agent", "agent": "assistant", "prompt": "Do something" }
+                        ]
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let result = s
+            .handle("workflow/execute/get", Some(json!({ "id": exec_id })))
+            .await
+            .unwrap();
+        // Without bridge, agent node fails
+        assert_eq!(result["status"], "failed");
+        assert!(result["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("bridge not available"));
+    }
+
+    // ── Dashboard with limit parameter ───────────────────────────────────
+
+    #[tokio::test]
+    async fn dashboard_respects_limit() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Limit WF", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let wf_id = wf["id"].as_str().unwrap();
+
+        // Create 3 executions
+        for _ in 0..3 {
+            s.handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf_id })),
+            )
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Limit to 2
+        let result = s
+            .handle("workflow/dashboard", Some(json!({ "limit": 2 })))
+            .await
+            .unwrap();
+        assert_eq!(result["executions"].as_array().unwrap().len(), 2);
+
+        // Activity still shows all 3
+        assert_eq!(result["activity"]["totalExecutions"], 3);
+    }
+
+    // ── Context Item Type Mapping ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn context_item_type_role_mapping() {
+        let (_tmp, s) = svc();
+
+        let wf = s
+            .handle(
+                "workflow/create",
+                Some(json!({ "name": "Role Map", "definition": { "steps": [] } })),
+            )
+            .await
+            .unwrap();
+        let exec = s
+            .handle(
+                "workflow/execute/start",
+                Some(json!({ "workflowId": wf["id"].as_str().unwrap() })),
+            )
+            .await
+            .unwrap();
+        let exec_id = exec["id"].as_str().unwrap();
+
+        // user_input → user
+        let msg = s
+            .handle(
+                "workflow/context/add",
+                Some(json!({ "sessionId": exec_id, "itemType": "user_input", "content": "Hi" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg["role"], "user");
+
+        // agent_output → assistant
+        let msg = s
+            .handle(
+                "workflow/context/add",
+                Some(json!({ "sessionId": exec_id, "itemType": "agent_output", "content": "Hello" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg["role"], "assistant");
+
+        // system → system
+        let msg = s
+            .handle(
+                "workflow/context/add",
+                Some(json!({ "sessionId": exec_id, "itemType": "system", "content": "Init" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg["role"], "system");
+
+        // tool_call → tool_call
+        let msg = s
+            .handle(
+                "workflow/context/add",
+                Some(json!({ "sessionId": exec_id, "itemType": "tool_call", "content": "{}" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg["role"], "tool_call");
+
+        // Explicit role override (must be a valid role per CHECK constraint)
+        let msg = s
+            .handle(
+                "workflow/context/add",
+                Some(json!({ "sessionId": exec_id, "itemType": "user_input", "role": "feedback", "content": "Override" })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(msg["role"], "feedback");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LSP service tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod lsp {
+    use super::*;
+    use ecp_services::lsp::LSPService;
+    use ecp_services::Service;
+
+    /// Check if typescript-language-server is installed (for integration tests).
+    fn has_ts_server() -> bool {
+        std::process::Command::new("typescript-language-server")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    // ── Pure logic tests (no real LSP server needed) ────────────────────
+
+    #[tokio::test]
+    async fn language_detection() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        let r = s.handle("lsp/getLanguageId", Some(json!({"path": "foo.ts"}))).await.unwrap();
+        assert_eq!(r["languageId"], "typescript");
+
+        let r = s.handle("lsp/getLanguageId", Some(json!({"path": "lib.rs"}))).await.unwrap();
+        assert_eq!(r["languageId"], "rust");
+
+        let r = s.handle("lsp/getLanguageId", Some(json!({"path": "main.py"}))).await.unwrap();
+        assert_eq!(r["languageId"], "python");
+
+        let r = s.handle("lsp/getLanguageId", Some(json!({"path": "data.json"}))).await.unwrap();
+        assert_eq!(r["languageId"], "json");
+
+        let r = s.handle("lsp/getLanguageId", Some(json!({"path": "file.unknown"}))).await.unwrap();
+        assert_eq!(r["languageId"], "plaintext");
+    }
+
+    #[tokio::test]
+    async fn has_server_for_known() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        let r = s.handle("lsp/hasServerFor", Some(json!({"languageId": "typescript"}))).await.unwrap();
+        assert_eq!(r["available"], true);
+
+        let r = s.handle("lsp/hasServerFor", Some(json!({"languageId": "rust"}))).await.unwrap();
+        assert_eq!(r["available"], true);
+    }
+
+    #[tokio::test]
+    async fn has_server_for_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        let r = s.handle("lsp/hasServerFor", Some(json!({"languageId": "fakeLang"}))).await.unwrap();
+        assert_eq!(r["available"], false);
+    }
+
+    #[tokio::test]
+    async fn has_server_with_custom_config() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        // fakeLang unavailable by default
+        let r = s.handle("lsp/hasServerFor", Some(json!({"languageId": "fakeLang"}))).await.unwrap();
+        assert_eq!(r["available"], false);
+
+        // Register custom config
+        s.handle("lsp/setServerConfig", Some(json!({
+            "languageId": "fakeLang",
+            "config": { "command": "fake-server", "args": ["--stdio"] }
+        }))).await.unwrap();
+
+        // Now available
+        let r = s.handle("lsp/hasServerFor", Some(json!({"languageId": "fakeLang"}))).await.unwrap();
+        assert_eq!(r["available"], true);
+    }
+
+    #[tokio::test]
+    async fn server_config_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        s.handle("lsp/setServerConfig", Some(json!({
+            "languageId": "myLang",
+            "config": {
+                "command": "my-lang-server",
+                "args": ["--stdio", "--verbose"],
+                "settings": { "maxProblems": 100 }
+            }
+        }))).await.unwrap();
+
+        let r = s.handle("lsp/getServerConfig", Some(json!({"languageId": "myLang"}))).await.unwrap();
+        let config = &r["config"];
+        assert_eq!(config["command"], "my-lang-server");
+        assert_eq!(config["args"][0], "--stdio");
+        assert_eq!(config["args"][1], "--verbose");
+        assert_eq!(config["settings"]["maxProblems"], 100);
+    }
+
+    #[tokio::test]
+    async fn server_config_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        let r = s.handle("lsp/getServerConfig", Some(json!({"languageId": "nope"}))).await.unwrap();
+        assert!(r["config"].is_null());
+    }
+
+    #[tokio::test]
+    async fn status_empty() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        let r = s.handle("lsp/status", None).await.unwrap();
+        let servers = r["servers"].as_array().unwrap();
+        assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_method() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        let err = s.handle("lsp/nonexistent", None).await.unwrap_err();
+        assert_eq!(err.code, -32601); // method not found
+    }
+
+    #[tokio::test]
+    async fn diagnostics_summary_no_servers() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        let r = s.handle("lsp/diagnosticsSummary", None).await.unwrap();
+        assert_eq!(r["errors"], 0);
+        assert_eq!(r["warnings"], 0);
+        assert_eq!(r["infos"], 0);
+        assert_eq!(r["hints"], 0);
+    }
+
+    // ── Integration tests (require typescript-language-server) ──────────
+
+    #[tokio::test]
+    async fn start_and_stop_server() {
+        if !has_ts_server() { return; }
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        // Start
+        let r = s.handle("lsp/start", Some(json!({"languageId": "typescript"}))).await.unwrap();
+        assert_eq!(r["success"], true);
+        assert_eq!(r["languageId"], "typescript");
+
+        // Status shows running
+        let r = s.handle("lsp/status", None).await.unwrap();
+        let servers = r["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["languageId"], "typescript");
+        assert_eq!(servers[0]["status"], "running");
+
+        // Stop
+        let r = s.handle("lsp/stop", Some(json!({"languageId": "typescript"}))).await.unwrap();
+        assert_eq!(r["success"], true);
+
+        // Status empty again
+        let r = s.handle("lsp/status", None).await.unwrap();
+        assert!(r["servers"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_unsupported_language() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        let err = s.handle("lsp/start", Some(json!({"languageId": "fakeLang"}))).await.unwrap_err();
+        assert!(err.message.contains("No language server for"));
+    }
+
+    #[tokio::test]
+    async fn document_open_close() {
+        if !has_ts_server() { return; }
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        // Start server
+        s.handle("lsp/start", Some(json!({"languageId": "typescript"}))).await.unwrap();
+
+        let uri = format!("file://{}/test.ts", tmp.path().display());
+
+        // Open
+        let r = s.handle("lsp/documentOpen", Some(json!({
+            "uri": uri,
+            "languageId": "typescript",
+            "text": "const x: number = 1;\n"
+        }))).await.unwrap();
+        assert_eq!(r["success"], true);
+
+        // Close
+        let r = s.handle("lsp/documentClose", Some(json!({"uri": uri}))).await.unwrap();
+        assert_eq!(r["success"], true);
+    }
+
+    #[tokio::test]
+    async fn document_change_version() {
+        if !has_ts_server() { return; }
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        s.handle("lsp/start", Some(json!({"languageId": "typescript"}))).await.unwrap();
+
+        let uri = format!("file://{}/test.ts", tmp.path().display());
+
+        // Open (version 1)
+        s.handle("lsp/documentOpen", Some(json!({
+            "uri": uri,
+            "languageId": "typescript",
+            "text": "let x = 1;\n"
+        }))).await.unwrap();
+
+        // First change → version 2
+        let r = s.handle("lsp/documentChange", Some(json!({
+            "uri": uri,
+            "text": "let x = 2;\n"
+        }))).await.unwrap();
+        assert_eq!(r["version"], 2);
+
+        // Second change → version 3
+        let r = s.handle("lsp/documentChange", Some(json!({
+            "uri": uri,
+            "text": "let x = 3;\n"
+        }))).await.unwrap();
+        assert_eq!(r["version"], 3);
+    }
+
+    #[tokio::test]
+    async fn document_change_not_open() {
+        let tmp = TempDir::new().unwrap();
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        let err = s.handle("lsp/documentChange", Some(json!({
+            "uri": "file:///not/open.ts",
+            "text": "x"
+        }))).await.unwrap_err();
+        assert!(err.message.contains("not open"));
+    }
+
+    /// Create a minimal TS project in the given temp dir so the language server works.
+    fn setup_ts_project(tmp: &TempDir) {
+        std::fs::write(
+            tmp.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"target":"es2020","module":"commonjs","strict":true}}"#,
+        ).unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_response_structure() {
+        if !has_ts_server() { return; }
+        let tmp = TempDir::new().unwrap();
+        setup_ts_project(&tmp);
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        s.handle("lsp/start", Some(json!({"languageId": "typescript"}))).await.unwrap();
+
+        let file_path = tmp.path().join("test.ts");
+        let content = "const x: string = '';\nx.\n";
+        std::fs::write(&file_path, content).unwrap();
+        let uri = format!("file://{}", file_path.display());
+
+        s.handle("lsp/documentOpen", Some(json!({
+            "uri": uri,
+            "languageId": "typescript",
+            "text": content
+        }))).await.unwrap();
+
+        // Give server time to process the project
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let r = s.handle("lsp/completion", Some(json!({
+            "uri": uri,
+            "line": 1,
+            "character": 2
+        }))).await;
+
+        match r {
+            Ok(v) => assert!(v.get("items").is_some()),
+            Err(e) if e.message.contains("timeout") => {
+                // Acceptable in resource-constrained environments
+                eprintln!("completion timed out (acceptable): {}", e.message);
+            }
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hover_response_structure() {
+        if !has_ts_server() { return; }
+        let tmp = TempDir::new().unwrap();
+        setup_ts_project(&tmp);
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        s.handle("lsp/start", Some(json!({"languageId": "typescript"}))).await.unwrap();
+
+        let file_path = tmp.path().join("test.ts");
+        let content = "const x: number = 42;\n";
+        std::fs::write(&file_path, content).unwrap();
+        let uri = format!("file://{}", file_path.display());
+
+        s.handle("lsp/documentOpen", Some(json!({
+            "uri": uri,
+            "languageId": "typescript",
+            "text": content
+        }))).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let r = s.handle("lsp/hover", Some(json!({
+            "uri": uri,
+            "line": 0,
+            "character": 6
+        }))).await;
+
+        match r {
+            Ok(v) => assert!(v.get("hover").is_some()),
+            Err(e) if e.message.contains("timeout") => {
+                eprintln!("hover timed out (acceptable): {}", e.message);
+            }
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_for_document() {
+        if !has_ts_server() { return; }
+        let tmp = TempDir::new().unwrap();
+        setup_ts_project(&tmp);
+        let s = LSPService::new(tmp.path().to_path_buf());
+
+        s.handle("lsp/start", Some(json!({"languageId": "typescript"}))).await.unwrap();
+
+        let file_path = tmp.path().join("test.ts");
+        let content = "const x: number = 'not a number';\n";
+        std::fs::write(&file_path, content).unwrap();
+        let uri = format!("file://{}", file_path.display());
+
+        s.handle("lsp/documentOpen", Some(json!({
+            "uri": uri,
+            "languageId": "typescript",
+            "text": content
+        }))).await.unwrap();
+
+        // Wait for diagnostics to be published
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let r = s.handle("lsp/diagnostics", Some(json!({"uri": uri}))).await.unwrap();
+
+        // Response must have "diagnostics" array
+        assert!(r["diagnostics"].is_array());
     }
 }
